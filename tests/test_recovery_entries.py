@@ -49,15 +49,15 @@ def test_configurable_cap_durable_rejections_do_not_count_and_settlement(tmp_pat
     signal = Signal("Up", D("5"), D(".53"), "test")
     ledger = Ledger(path, settings)
     with pytest.raises(Rejected):
-        ledger.execute(market, make_book(size="1"), signal, 1800000002)
-    assert ledger.execute(market, make_book(), signal, 1800000002)
+        ledger.execute(market, make_book(size="1"), signal, 1800000002, clock=lambda: 1800000002)
+    assert ledger.execute(market, make_book(), signal, 1800000002, clock=lambda: 1800000002)
     ledger.close()
     ledger = Ledger(path, settings)
-    assert ledger.execute(market, make_book(), signal, 1800000002)
+    assert ledger.execute(market, make_book(), signal, 1800000002, clock=lambda: 1800000002)
     ledger.close()
     ledger = Ledger(path, settings)
     assert ledger.window_entry_limit_reached(market.slug)
-    assert ledger.execute(market, make_book(), signal, 1800000002) is None
+    assert ledger.execute(market, make_book(), signal, 1800000002, clock=lambda: 1800000002) is None
     assert len(ledger.pending()) == 1
     ledger.settle(
         market,
@@ -73,7 +73,7 @@ def test_configurable_cap_durable_rejections_do_not_count_and_settlement(tmp_pat
     )
     assert ledger.summary()["settlements"] == 2
     assert ledger.summary()["pending"] == 0
-    assert ledger.execute(market, make_book(), signal, 1800000002) is None
+    assert ledger.execute(market, make_book(), signal, 1800000002, clock=lambda: 1800000002) is None
     ledger.close()
 
 
@@ -99,6 +99,13 @@ def test_service_recovery_and_repeated_signals_across_restart(tmp_path, reason, 
         instance.books = {"up": make_book(), "down": make_book("down")}
         instance.strategy = SimpleNamespace(
             signal=lambda *a: Signal("Up", D("5"), D(".53"), "test")
+        )
+        epoch = instance.continuity.begin(instance.stream, set(instance.books))
+        for book in instance.books.values():
+            book.continuity_epoch = epoch
+            book.continuity_sync_sequence = instance.continuity.sync_sequence
+        assert instance.continuity.complete(
+            epoch, instance.stream, instance.books, instance.clock()
         )
         return instance
 
@@ -142,6 +149,7 @@ def test_entry_allowance_does_not_bypass_risk_limits(tmp_path, field):
             make_book(),
             Signal("Up", D("5"), D(".53"), "risk"),
             1800000002,
+            clock=lambda: 1800000002,
         )
     assert not ledger.window_entry_limit_reached(Market.from_event(event()).slug)
     assert ledger.summary()["fills"] == 0
@@ -152,7 +160,13 @@ def test_legacy_window_backfill_and_disabled_recovery(tmp_path):
     path = tmp_path / "db"
     ledger = Ledger(path, Settings())
     market = Market.from_event(event())
-    ledger.execute(market, make_book(), Signal("Up", D("5"), D(".53"), "legacy"), 1800000002)
+    ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D(".53"), "legacy"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     ledger.trip("abnormal_spread", 1800000003)
     ledger.db.execute("DROP TABLE order_windows")
     ledger.db.execute("DROP TABLE equity_snapshots")
@@ -184,7 +198,13 @@ def test_invalid_entry_recovery_settings(name, value):
 def test_settlement_loss_replaces_transient_before_recovery(tmp_path):
     ledger = Ledger(tmp_path / "db", Settings(max_consecutive_losses=1))
     market = Market.from_event(event())
-    ledger.execute(market, make_book(), Signal("Up", D("5"), D(".53"), "loss"), 1800000002)
+    ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D(".53"), "loss"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     ledger.trip("abnormal_spread", 1800000003)
     ledger.settle(
         market,
@@ -210,21 +230,41 @@ def test_shared_outcome_cap_and_pending_exposure_after_first_entry(tmp_path):
     settings = Settings(max_entries_per_window=2, max_exposure=D("4"))
     market = Market.from_event(event())
     ledger = Ledger(path, settings)
-    assert ledger.execute(market, make_book(), Signal("Up", D("5"), D(".53"), "first"), 1800000002)
+    assert ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D(".53"), "first"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     with pytest.raises(Rejected, match="exposure"):
         ledger.execute(
-            market, make_book("down"), Signal("Down", D("5"), D(".53"), "second"), 1800000002
+            market,
+            make_book("down"),
+            Signal("Down", D("5"), D(".53"), "second"),
+            1800000002,
+            clock=lambda: 1800000002,
         )
     assert not ledger.window_entry_limit_reached(market.slug)
     ledger.close()
     # A budget increase allows exactly the unused successful-fill slot, across outcomes.
     ledger = Ledger(path, Settings(max_entries_per_window=2))
     assert ledger.execute(
-        market, make_book("down"), Signal("Down", D("5"), D(".53"), "second"), 1800000002
+        market,
+        make_book("down"),
+        Signal("Down", D("5"), D(".53"), "second"),
+        1800000002,
+        clock=lambda: 1800000002,
     )
     assert ledger.window_entry_limit_reached(market.slug)
     assert (
-        ledger.execute(market, make_book(), Signal("Up", D("5"), D(".53"), "third"), 1800000002)
+        ledger.execute(
+            market,
+            make_book(),
+            Signal("Up", D("5"), D(".53"), "third"),
+            1800000002,
+            clock=lambda: 1800000002,
+        )
         is None
     )
     ledger.close()
@@ -236,9 +276,9 @@ def test_multi_entry_settlement_accepts_refreshed_mutable_market_constraints(tmp
     ledger = Ledger(tmp_path / "db", Settings(max_entries_per_window=2))
     market = Market.from_event(event())
     signal = Signal("Up", D("6"), D(".53"), "metadata refresh")
-    ledger.execute(market, make_book(), signal, 1800000002)
+    ledger.execute(market, make_book(), signal, 1800000002, clock=lambda: 1800000002)
     refreshed = replace(market, min_size=D("6"), tick=D(".001"))
-    ledger.execute(refreshed, make_book(), signal, 1800000002)
+    ledger.execute(refreshed, make_book(), signal, 1800000002, clock=lambda: 1800000002)
     result = ledger.settle(
         market,
         dict(

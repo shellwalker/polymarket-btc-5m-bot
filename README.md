@@ -117,7 +117,7 @@ tail -f runtime/logs/paper.jsonl
 
 `signal` 保存信号时刻的 `signal_quote`：best bid/ask/mid、CLOB `source_at`、本地盘口接收应用时间 `received_at`、两种 age（秒）、健康状态和观测时刻，价格为精确 Decimal 字符串。未来的 `order_at/order_quote/order_id/attempt_id/fill_ladder/execution_slippage/signal_to_order_move` 明确为 `null`。后续 `order_attempt`、`order_result` 和 `paper_fill` 通过 `signal_id` 关联；每次实际订单尝试另有 `attempt_id`。订单尝试保存独立的订单时刻盘口，即使拒绝，也保留此快照和独立结果事件；原 `order_rejected` 人类可读日志的去重保持不变。只有成交才有非空 `order_id` 和逐档 `fill_ladder`（price/quantity/fee）。`paper_fill` 与资金/成交在同一事务内提交；进程若在尝试与结果之间崩溃，可能留下无结果的 `order_attempt`，不会回填成虚构成功/拒绝。直接调用账本而无上游信号时，信号信息为 `null`，不伪造信号。
 
-`paper_fill` 的 `execution_slippage = average_price - order_quote.best_ask`，`signal_to_order_move = order_quote.best_ask - signal_quote.best_ask`，均为绝对价格单位，分开记录，不能混为同一种滑点。费用单列，不包含在这两个价格差中。`signal_at` 是既有决策时间，`order_at` 是调用模拟执行时的本地观测时间，`decision_at` 保留原决策检查时间；新增观测不会改变原时间窗口、风控、费用或滑点检查。它们不代表真实交易所的下单或成交时间。
+`paper_fill` 的 `execution_slippage = average_price - order_quote.best_ask`，`signal_to_order_move = order_quote.best_ask - signal_quote.best_ask`，均为绝对价格单位，分开记录，不能混为同一种滑点。费用单列，不包含在这两个价格差中。`signal_at` 是既有决策时间，`order_at` 是调用模拟执行时的本地观测时间，`decision_at` 保留原决策时间，仅用于审计，不能授权晚到成交；时间窗口、风控、费用和滑点阈值保持原值，执行校验改用当前时间。它们不代表真实交易所的下单或成交时间。
 
 权益默认每15秒写入 `equity_snapshots`，记录 cash、每笔未结算持仓、bid/mid 市值、两种 equity 及回撤；`health.equity_snapshot` 显示最近已记录快照和累计回撤，`equity_snapshot_age_seconds/overdue` 提示快照年龄/是否超过配置间隔。该值是带时间戳的历史观测，不承诺当前可平仓金额。估值工作在独立后台任务中，只对账本里所有未结算 token（包括旧窗口）读取公开 CLOB `/book`，按身份、tick、深度及服务端/本地时间验证；最多4个并发，每轮后等待 `min(equity_snapshot_seconds/2, valuation_stale_seconds/2)`。网络延迟可能使刷新变慢，决策和快照计时不等待估值请求。估值不读取 Gamma 价格，不更新策略盘口、不消耗其深度、不触发新行情熔断，也不参与任何交易过滤。
 
@@ -156,7 +156,7 @@ uv run --locked btc5m stats --run-id legacy
 | 可靠性参数 | 默认（秒） | 作用 |
 | --- | --- | --- |
 | diagnostic_heartbeat_seconds | 15 | 独立诊断心跳间隔 |
-| continuity_gap_seconds / clock_tolerance_seconds | 30 / 2 | 连续性缺口与时钟差分诊断阈值，不参与交易过滤 |
+| continuity_gap_seconds / clock_tolerance_seconds | 30 / 2 | 连续性缺口与时钟差分诊断阈值；现有时钟偏差限额也用于安全屏障 |
 | http_response_seconds | 15 | 一次完整HTTP响应预算，包括持续分块读取的body |
 | http_total_seconds | 60 | 最多4次请求及退避共享总预算，单次取剩余预算与响应预算较小值 |
 | ws_sync_seconds | 65 | 分别用于REST重同步、订阅成功后的WS初始双token快照同步；两段各有独立总预算 |
@@ -165,7 +165,7 @@ uv run --locked btc5m stats --run-id legacy
 | slow_operation_seconds | 0.1 | DB事务/汇总、日志emit/轮转和health写入的慢操作阈值 |
 | slow_diagnostic_throttle_seconds | 60 | 同类slow_operation诊断日志的最短间隔 |
 
-以上参数须为有限正数，仅影响可靠性和观测。原有HTTP阶段超时、重试类别/最多次数/指数退避、WS心跳与PONG阈值保持原值。HTTP 404不重试；慢速分块即使每次读取都未超过阶段超时，也不能无限延长完整响应预算。超时记录 `operation_deadline`；预算包含异步等待，不能抢占同步JSON解析/CPU或被阻塞的事件循环；解码后仍检查整体期限。库握手与关闭期限继续生效。离线测试通过HTTPX/httpcore的实际HTTP/1.1解析链注入缓慢chunked字节流，不用一次性假响应代替body读取；该测试不代表真实TCP网络验证。
+以上参数须为有限正数，仅影响可靠性、连续性安全和观测，不改变策略/风险阈值。原有HTTP阶段超时、重试类别/最多次数/指数退避、WS心跳与PONG阈值保持原值。HTTP 404不重试；慢速分块即使每次读取都未超过阶段超时，也不能无限延长完整响应预算。超时记录 `operation_deadline`；预算包含异步等待，不能抢占同步JSON解析/CPU或被阻塞的事件循环；解码后仍检查整体期限。库握手与关闭期限继续生效。离线测试通过HTTPX/httpcore的实际HTTP/1.1解析链注入缓慢chunked字节流，不用一次性假响应代替body读取；该测试不代表真实TCP网络验证。
 
 初始WS快照同步与周期PONG存活检查是独立条件。订阅发送成功后即启动固定monotonic期限；PONG、持续消息、单个token快照都不能续期，必须在期限内收到全部token的有效初始盘口。接收轮询及初始阶段PING发送取剩余同步预算，解析后也重新检查期限，超时不发布ready状态。失败先使盘口无效、确认旧接收任务清理并退出旧连接上下文，再按既有退避重连；拒绝取消时保持隔离，不建立替代订阅。
 
@@ -184,6 +184,24 @@ HTTP/WS超时诊断使用实测monotonic `elapsed_seconds`，受监督操作还�
 uv run --locked btc5m health
 uv run --locked btc5m stats --since 2026-11-07T10:00:00-08:00 --run-id '替换为实际UUID'
 ```
+
+## 连续性epoch安全屏障
+
+`heartbeat/continuity_gap` 是诊断记录；交易保护另有一个进程内共享 `ContinuityBarrier`，由命令行服务固定传给WS和账本入口。它不等待诊断轮询：交易入口、WS每次等待前后/帧处理前后、REST快照返回后及成交事务都同步检查。首次启动处于blocked状态；新run重新建立自己的时钟基线和全量盘口，不从旧health/事件恢复开放状态。
+
+屏障比较wall/monotonic/boottime的相邻差分和自当前epoch基线以来的累计时钟偏差。任意可观测倒退、无检查间隔超过 `min(stale_seconds, continuity_gap_seconds)`，或wall/boottime相对monotonic累计偏差超过原有 `clock_tolerance_seconds`，都会递增epoch并封锁入场。默认无检查上限是原有盘口新鲜度5秒，偏差限额2秒；30秒仍是中性心跳缺口诊断限额，所有既有配置值不变。屏障是数据连续性/执行安全检查，不改变动量信号、策略锚点、节流、费用、滑点或风险限额。
+
+检测到异常后，先同步废弃旧订阅代际、断开并清空旧深度及估值缓存，再异步清理。屏障回调不写DB、不运行策略，避免在已有成交事务里意外提交；`continuity_barrier` 和 `continuity_resynced` 事件稍后由诊断路径持久化，原因仍标记unknown。带新时间戳的delta不能使旧asks恢复可用。每次同步另有 `sync_sequence` 和订阅租约；盘口同时标记epoch/同步序号，即便epoch未变，新订阅也不能使用上一订阅的快照。
+
+确认旧任务取消和连接上下文关闭后才允许替代订阅。若旧流已在关闭中，先有界等待其有序退出；关闭未确认或取消失败则沿用进程隔离状态，不重叠订阅。新epoch重新执行公开REST全量同步，并等待两个token各自的新WS初始book快照，所有盘口新鲜、身份与epoch/序号匹配后才开放屏障。单token快照、PONG、旧回调、跨epoch返回的REST/WS响应均不能开放。窗口已结束则等待发现当前市场，不补跑过去窗口或伪造历史报价/成交。屏障开放只恢复数据准入；`consecutive_losses` 等人工亏损锁存保持原值，仍会独立拒绝交易，清理和恢复不调用reset-circuit。
+
+账本 `execute()` 默认读取当前wall clock；服务注入当前clock和捕获的epoch/代际校验，离线回放需显式注入固定clock。`BEGIN IMMEDIATE` 等锁返回后、计算/风控之后、写入前以及全部SQL写入（含paper_fill审计INSERT）之后、COMMIT之前重查当前窗口、当前健康盘口、epoch/同步序号、代际和风险。SQL写入后检查风险时不重复预留已经插入的自身敞口。检查失败会回滚订单、逐档成交、现金和成交额度，拒绝审计仍可记录；观察与官方结算可继续。
+
+审计继续保留 signal_at、decision_at、signal_quote。order_at/order_quote是账本入口实际观测，传入的订单观测另存requested_order_at；transaction_at是获得事务锁后的采样，execution_at/execution_quote是写入前采样，commit_check_at是可持久化的审计INSERT前采样，均不声称是真实COMMIT完成时刻。审计INSERT后还有不再追加SQL写入的最终保护检查；因此其精确时刻不伪装成已经提前写入的字段。新字段只用于新记录，无schema迁移、历史重算或旧金额/费用重写。
+
+`health.reliability.continuity` 显示epoch、blocked、state、sync_sequence、所需token和最近异常；`continuity_recovery_needed` 显示是否等待替代同步，`generation/cleanup_failed` 继续显示代际/取消安全状态。`trading_ready` 还要求屏障开放；数据恢复与风险锁存是两种独立状态。
+
+**应用侧已修复的是：可检测的连续性异常不能借新delta洗新旧深度、旧决策时间不能授权等待之后的成交。历史24分钟空白的平台根因仍为UNKNOWN。** 同线程检查不能抢占整机暂停、同步I/O或COMMIT内部阻塞；最后一次检查之后若立即挂起/跳时钟，仍存在不可消除的检查—提交间隙。程序不宣称可原子证明平台连续性，也不会事后编造成交或反写历史账本来掩盖这一限制。
 
 ## 紧急停止和恢复
 

@@ -22,6 +22,11 @@ def ready_service(tmp_path, **config):
     )
     service.ledger = Ledger(tmp_path / "ledger.sqlite3", settings)
     service.strategy = SimpleNamespace(signal=lambda *a: Signal("Up", D("5"), D(".53"), "decision"))
+    epoch = service.continuity.begin(service.stream, set(service.books))
+    for book in service.books.values():
+        book.continuity_epoch = epoch
+        book.continuity_sync_sequence = service.continuity.sync_sequence
+    assert service.continuity.complete(epoch, service.stream, service.books, service.clock())
     return service
 
 
@@ -66,7 +71,9 @@ def test_fee_multiplier_per_level_cash_and_risk(tmp_path):
     book.asks[D(".52")] = D("10")
     settings = Settings(paper_fee_multiplier=D("2"))
     ledger = Ledger(tmp_path / "ledger.sqlite3", settings)
-    fill = ledger.execute(market, book, Signal("Up", D("5"), D(".53"), "test"), 1800000002)
+    fill = ledger.execute(
+        market, book, Signal("Up", D("5"), D(".53"), "test"), 1800000002, clock=lambda: 1800000002
+    )
     expected = fee(D("3"), D(".51"), D(".14")) + fee(D("2"), D(".52"), D(".14"))
     assert D(fill["fee"]) == expected
     assert D(ledger.summary()["cash"]) == D("1000") - D("2.57") - expected
@@ -82,11 +89,19 @@ def test_fee_multiplier_per_level_cash_and_risk(tmp_path):
         if rejected:
             with pytest.raises(Rejected, match="trade"):
                 ledger.execute(
-                    market, make_book(), Signal("Up", D("5"), D(".53"), "test"), 1800000002
+                    market,
+                    make_book(),
+                    Signal("Up", D("5"), D(".53"), "test"),
+                    1800000002,
+                    clock=lambda: 1800000002,
                 )
         else:
             assert ledger.execute(
-                market, make_book(), Signal("Up", D("5"), D(".53"), "test"), 1800000002
+                market,
+                make_book(),
+                Signal("Up", D("5"), D(".53"), "test"),
+                1800000002,
+                clock=lambda: 1800000002,
             )
         ledger.close()
 
@@ -130,6 +145,9 @@ def test_repeated_rejected_signals_rate_limited(tmp_path):
     assert service.ledger.summary()["event_counts"]["order_rejected"] == 1
     service.clock = lambda: 1800000033.0
     service.books = {"up": make_book(now=1800000033), "down": make_book("down", now=1800000033)}
+    for book in service.books.values():
+        book.continuity_epoch = service.continuity.epoch
+        book.continuity_sync_sequence = service.continuity.sync_sequence
     service.update()
     assert service.ledger.summary()["event_counts"]["signal"] == 2
     service.ledger.close()

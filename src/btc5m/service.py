@@ -16,6 +16,7 @@ from typing import IO, Any
 from uuid import uuid4
 
 from .config import Settings
+from .continuity import ContinuityBarrier
 from .domain import ZERO, Book, Market, MomentumStrategy, fee, number
 from .ledger import Ledger, Rejected
 from .public import MarketStream
@@ -93,6 +94,7 @@ class Service:
         connect: Any = None,
         run_id: str | None = None,
         diagnostics: Diagnostics | None = None,
+        continuity: ContinuityBarrier | None = None,
     ) -> None:
         self.settings, self.api, self.clock = settings, api, clock
         self.run_id = run_id or current_run_id()
@@ -124,6 +126,9 @@ class Service:
         self.switching = False
         self.last_rejection = ""
         self.geo: dict[str, Any] = {}
+        self.continuity = continuity or ContinuityBarrier(settings, clocks=self.diagnostics.clocks)
+        self.continuity.on_break = self.continuity_broken
+        self.recovery_needed = False
 
     def record(self, kind: str, details: dict[str, Any]) -> None:
         details = {**details, "run_id": self.run_id}
@@ -156,7 +161,60 @@ class Service:
         except Exception:
             LOG.exception("reliability_halt_audit_failed")
 
+    def continuity_broken(self) -> None:
+        # Called synchronously, potentially inside a ledger transaction. Never write
+        # logs/DB or attempt nested async cleanup here: fence first, audit later.
+        self.generation += 1
+        self.recovery_needed = True
+        self.retire_stream()
+        self.stream_stop.set()
+        self.valuation_books.clear()
+        for book in self.books.values():
+            book.bids.clear()
+            book.asks.clear()
+            book.continuity_epoch = None
+            book.continuity_sync_sequence = None
+        if self.ledger is not None:
+            self.ledger.clear_recovery_progress()
+
+    def entry_allowed(self, epoch: int, generation: int, owner: object | None) -> bool:
+        allowed = self.continuity.allowed(epoch, owner)
+        return bool(
+            allowed
+            and generation == self.generation
+            and not self.cleanup_failed
+            and not self.closing
+            and not self.supervisor.unsafe
+            and not self.stop.is_set()
+            and not (self.settings.runtime_dir / "STOP").exists()
+            and self.stream is not None
+            and self.stream.ready
+            and self.market is not None
+            and set(self.books) == set(self.market.tokens.values())
+            and all(
+                b.continuity_epoch == epoch
+                and b.continuity_sync_sequence == self.continuity.sync_sequence
+                and b.healthy(self.clock(), self.settings.stale_seconds)
+                for b in self.books.values()
+            )
+        )
+
+    async def recover_continuity(self) -> None:
+        if not self.recovery_needed or self.cleanup_failed or self.closing:
+            return
+        target = self.market
+        if target is not None and not target.start <= self.clock() < target.end:
+            target = None
+        await self.switch(target)
+
     def emit_heartbeat(self) -> None:
+        self.continuity.poll()
+        events, self.continuity.events = self.continuity.events, []
+        for kind, event_details in events:
+            event_details = {**event_details, "run_id": self.run_id}
+            LOG.info(kind, extra={"details": event_details})
+            if self.ledger is not None:
+                self.ledger.event(kind, event_details, event_details["recovered_at"])
         beat, gap = self.diagnostics.heartbeat(self.run_id)
         if beat is None:
             return
@@ -183,6 +241,11 @@ class Service:
             return
         if self.ledger is None or self.market is None or self.switching:
             return
+        self.continuity.poll()
+        epoch, generation, owner = self.continuity.epoch, self.generation, self.continuity.owner
+        if self.continuity.blocked:
+            return
+        sync_sequence = self.continuity.sync_sequence
         now = self.clock()
         ready = self.stream is not None and self.stream.ready
         healthy = ready and all(
@@ -192,6 +255,8 @@ class Service:
             self.ledger.observe_market_health(False, None, now)
             if self.ever_ready and now < self.market.end:
                 self.ledger.trip("stale_or_disconnected_book", now)
+            return
+        if not self.entry_allowed(epoch, generation, owner):
             return
         self.ever_ready = True
         if any(
@@ -235,6 +300,9 @@ class Service:
                 "attempt_id": None,
                 "order_id": None,
                 "signal_at": now,
+                "continuity_epoch": epoch,
+                "continuity_sync_sequence": self.continuity.sync_sequence,
+                "stream_generation": generation,
                 "signal_quote": signal_quote,
                 "order_at": None,
                 "order_quote": None,
@@ -254,7 +322,11 @@ class Service:
                     "signal_at": now,
                     "signal_quote": signal_quote,
                     "order_at": self.clock(),
+                    "continuity_epoch": epoch,
+                    "continuity_sync_sequence": sync_sequence,
                 },
+                clock=self.clock,
+                continuity_check=lambda: self.entry_allowed(epoch, generation, owner),
             )
             if fill is not None:
                 LOG.info("paper_fill", extra={"details": fill})
@@ -289,7 +361,7 @@ class Service:
                         self.ledger.trip("market_identity_changed", self.clock())
                     await self._switch(None)
                     raise ValueError("same-window market identity changed")
-                if self.market is not None:
+                if self.market is not None and not self.recovery_needed:
                     # Polling metadata can lag WS dynamic ticks. Refresh constraints
                     # in place; only the ordered WS/snapshot feed changes book ticks.
                     self.market = replace(self.market, min_size=market.min_size)
@@ -300,16 +372,30 @@ class Service:
         self.generation += 1
         generation = self.generation
         self.retire_stream()
+        self.continuity.block("cancelling_subscription")
         try:
             self.stream_stop.set()
             if self.stream_task is not None:
                 self.diagnostics.progress("stream", "cancelling")
+                # A continuity failure can already be in orderly context exit. Do
+                # not interrupt that close and mistake task cancellation for closure.
+                if isinstance(self.stream, MarketStream) and self.stream.session_closing:
+                    _, pending = await asyncio.wait(
+                        [self.stream_task], timeout=self.settings.cleanup_seconds
+                    )
+                    if pending:
+                        self.supervisor.unsafe = True
                 if not await self.supervisor.cancel([self.stream_task], "service.stream_cancel"):
                     self.fail_closed("stream_cancel_budget_exceeded")
                     return
             if self.supervisor.unsafe:
                 self.fail_closed("incomplete_task_cleanup")
                 return
+            self.continuity.poll()
+            if market is not None and not market.start <= self.clock() < market.end:
+                market = None
+            generation = self.generation
+            self.recovery_needed = False
             if self.stream is not None:
                 self.prior_reconnects += self.stream.reconnects
             self.market, self.books, self.stream = market, {}, None
@@ -338,6 +424,7 @@ class Service:
                 clock=self.clock,
                 supervisor=self.supervisor,
                 progress=lambda phase: self.diagnostics.progress("stream", phase),
+                continuity=self.continuity,
                 **kwargs,
             )
             self.stream_task = asyncio.create_task(self.stream.run(self.stream_stop))
@@ -376,6 +463,7 @@ class Service:
         return sorted({reason for reasons in candidates for reason in reasons})
 
     def health(self, *, stopped: bool = False) -> None:
+        self.continuity.poll()
         now = self.clock()
         healthy = (
             not stopped
@@ -387,6 +475,11 @@ class Service:
         summary = self.ledger.summary() if self.ledger is not None else {}
         risk_blocked = self.risk_blocked_reasons(now)
         equity = self.ledger.latest_equity() if self.ledger else None
+        self.continuity.poll()
+        now = self.clock()
+        healthy = healthy and all(
+            b.healthy(now, self.settings.stale_seconds) for b in self.books.values()
+        )
         with self.slow.measure("health.write"):
             atomic_json(
                 self.settings.runtime_dir / "health.json",
@@ -397,6 +490,8 @@ class Service:
                         "heartbeat": self.diagnostics.latest,
                         "workers": self.diagnostics.workers,
                         "generation": self.generation,
+                        "continuity": self.continuity.status(),
+                        "continuity_recovery_needed": self.recovery_needed,
                         "cleanup_failed": self.cleanup_failed,
                         "owned_pending_tasks": len(self.supervisor.pending),
                         "operation_durations": self.supervisor.operation_durations,
@@ -416,6 +511,7 @@ class Service:
                     "connected": self.stream.ready if self.stream else False,
                     "trading_ready": bool(
                         healthy
+                        and not self.continuity.blocked
                         and not self.stop.is_set()
                         and not risk_blocked
                         and not summary.get("circuit")
@@ -461,7 +557,10 @@ class Service:
         async def fetch(token: str, tick: str) -> None:
             async with semaphore:
                 try:
+                    request_epoch = self.continuity.poll()
                     raw = await self.api.snapshot(token)
+                    if request_epoch != self.continuity.poll():
+                        return
                     if self.cleanup_failed or self.closing:
                         return
                     book = Book(token, number(tick))
@@ -524,7 +623,11 @@ class Service:
                 continue
             try:
                 self.diagnostics.progress("discovery", "request")
+                request_epoch = self.continuity.poll()
                 current, following = await self.api.discover(self.clock())
+                if request_epoch != self.continuity.poll():
+                    await self.pause(stop, self.settings.discovery_seconds)
+                    continue
                 if self.cleanup_failed or self.closing:
                     return
                 self.diagnostics.progress("discovery", "received")
@@ -621,6 +724,7 @@ class Service:
                     self.emit_heartbeat()
                     if self.supervisor.unsafe:
                         self.fail_closed("incomplete_task_cleanup")
+                    await self.recover_continuity()
                     if (settings.runtime_dir / "STOP").exists():
                         self.record("emergency_stop", {"source": "file_or_command"})
                         stop.set()

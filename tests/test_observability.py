@@ -38,6 +38,7 @@ def test_correlated_fill_ladder_and_separate_price_moves(tmp_path):
             "signal_quote": signal_quote,
             "order_at": 1800000002,
         },
+        clock=lambda: 1800000002,
     )
     assert result["signal_id"] == "signal-a"
     assert result["order_quote"]["best_ask"] == "0.51"
@@ -64,11 +65,11 @@ def test_rejected_attempts_and_persistent_circuit_interval(tmp_path):
     signal = Signal("Up", D("5"), D(".53"), "test")
     for _ in range(2):
         with pytest.raises(Rejected, match="circuit"):
-            ledger.execute(market, make_book(), signal, 1800000002)
+            ledger.execute(market, make_book(), signal, 1800000002, clock=lambda: 1800000002)
     ledger.close()
     ledger = Ledger(path, Settings(), run_id="second")
     with pytest.raises(Rejected):
-        ledger.execute(market, make_book(), signal, 1800000003)
+        ledger.execute(market, make_book(), signal, 1800000003, clock=lambda: 1800000003)
     ledger.reset_circuit(1800000010)
     interval = dict(ledger.db.execute("SELECT * FROM circuit_intervals").fetchone())
     assert interval["reason"] == "daily_loss"
@@ -87,7 +88,11 @@ def test_complete_and_incomplete_marks_drawdown_survive_restart(tmp_path):
     ledger = Ledger(path, settings, run_id="first")
     ledger.record_equity({}, 1800000001)
     ledger.execute(
-        Market.from_event(event()), make_book(), Signal("Up", D("5"), D(".53"), "test"), 1800000002
+        Market.from_event(event()),
+        make_book(),
+        Signal("Up", D("5"), D(".53"), "test"),
+        1800000002,
+        clock=lambda: 1800000002,
     )
     book = make_book(bid=".40", ask=".42")
     snapshot = ledger.record_equity({"up": book}, 1800000002)
@@ -221,7 +226,11 @@ def test_stats_drawdown_uses_selected_complete_samples_and_interval_overlap(tmp_
     ledger = Ledger(path, Settings(), run_id="a")
     ledger.record_equity({}, 1)
     ledger.execute(
-        Market.from_event(event()), make_book(), Signal("Up", D("5"), D(".53"), "test"), 1800000002
+        Market.from_event(event()),
+        make_book(),
+        Signal("Up", D("5"), D(".53"), "test"),
+        1800000002,
+        clock=lambda: 1800000002,
     )
     ledger.record_equity({"up": make_book(bid=".40", ask=".42")}, 1800000002)
     ledger.record_equity({}, 1800000003)
@@ -232,6 +241,7 @@ def test_stats_drawdown_uses_selected_complete_samples_and_interval_overlap(tmp_
             make_book(),
             Signal("Up", D("5"), D(".53"), "test"),
             1800000004,
+            clock=lambda: 1800000004,
         )
         is None
     )
@@ -246,7 +256,11 @@ def test_stats_drawdown_uses_selected_complete_samples_and_interval_overlap(tmp_
     )
     with pytest.raises(Rejected):
         ledger.execute(
-            other, make_book(now=1800000302), Signal("Up", D("5"), D(".53"), "test"), 1800000302
+            other,
+            make_book(now=1800000302),
+            Signal("Up", D("5"), D(".53"), "test"),
+            1800000302,
+            clock=lambda: 1800000302,
         )
     ledger.reset_circuit(1800000310)
     ledger.close()
@@ -302,6 +316,9 @@ def test_service_circuit_counts_not_deduplicated_or_throttle_evaluations(tmp_pat
     for stamp in (1800000002, 1800000033, 1800000064):
         service.clock = lambda stamp=stamp: stamp
         service.books = {"up": make_book(now=stamp), "down": make_book("down", now=stamp)}
+        for book in service.books.values():
+            book.continuity_epoch = service.continuity.epoch
+            book.continuity_sync_sequence = service.continuity.sync_sequence
         for _ in range(10):
             service.update()
     counts = service.ledger.summary()["event_counts"]
@@ -343,7 +360,13 @@ async def test_valuation_fetch_wait_never_blocks_execution_or_mutates_books(tmp_
 
     service = ready_service(tmp_path, max_entries_per_window=2)
     market = service.market
-    service.ledger.execute(market, make_book(), Signal("Up", D("5"), D(".53"), "prior"), 1800000002)
+    service.ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D(".53"), "prior"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     requested = asyncio.Event()
     release = asyncio.Event()
 
@@ -394,9 +417,15 @@ async def test_marks_cover_old_windows_validate_clob_and_never_use_gamma(tmp_pat
         end=1800000600,
         tokens={"Up": "u2", "Down": "d2"},
     )
-    service.ledger.execute(old, make_book(), Signal("Up", D("5"), D(".53"), "old"), 1800000002)
     service.ledger.execute(
-        new, make_book("u2", now=now), Signal("Up", D("5"), D(".53"), "new"), now
+        old,
+        make_book(),
+        Signal("Up", D("5"), D(".53"), "old"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
+    service.ledger.execute(
+        new, make_book("u2", now=now), Signal("Up", D("5"), D(".53"), "new"), now, clock=lambda: now
     )
     service.market = new
     service.books = {"u2": make_book("u2", now=now), "d2": make_book("d2", now=now)}
@@ -519,7 +548,11 @@ async def test_invalid_valuation_quotes_are_incomplete_without_new_breakers(tmp_
 
     service = ready_service(tmp_path, max_entries_per_window=2)
     service.ledger.execute(
-        service.market, make_book(), Signal("Up", D("5"), D(".53"), "prior"), 1800000002
+        service.market,
+        make_book(),
+        Signal("Up", D("5"), D(".53"), "prior"),
+        1800000002,
+        clock=lambda: 1800000002,
     )
 
     class API:

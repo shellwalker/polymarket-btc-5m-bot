@@ -14,13 +14,13 @@ def test_fill_restart_no_duplicate_and_authoritative_settlement(tmp_path):
     market = Market.from_event(event())
     ledger = Ledger(path, settings)
     signal = Signal("Up", D("5"), D("0.53"), "observed momentum")
-    fill = ledger.execute(market, make_book(), signal, 1800000002)
+    fill = ledger.execute(market, make_book(), signal, 1800000002, clock=lambda: 1800000002)
     assert fill is not None
     assert D(ledger.summary()["cash"]) == D("1000") - D("2.55") - D("0.08747")
     ledger.close()
     ledger = Ledger(path, settings)
     assert len(ledger.pending()) == 1
-    assert ledger.execute(market, make_book(), signal, 1800000002) is None
+    assert ledger.execute(market, make_book(), signal, 1800000002, clock=lambda: 1800000002) is None
     assert (
         ledger.settle(
             market,
@@ -53,7 +53,7 @@ def test_depth_slippage_tick_and_minimum_rejection(tmp_path):
         (Signal("Up", D("5"), D("0.50"), "test"), make_book()),
     ]:
         with pytest.raises(Rejected):
-            ledger.execute(market, book, signal, 1800000002)
+            ledger.execute(market, book, signal, 1800000002, clock=lambda: 1800000002)
     assert ledger.summary()["fills"] == 0
     assert ledger.summary()["cash"] == "1000"
 
@@ -64,13 +64,25 @@ def test_exposure_and_circuit_persist(tmp_path):
     ledger = Ledger(path, settings)
     market = Market.from_event(event())
     with pytest.raises(Rejected, match="trade"):
-        ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+        ledger.execute(
+            market,
+            make_book(),
+            Signal("Up", D("5"), D("0.53"), "test"),
+            1800000002,
+            clock=lambda: 1800000002,
+        )
     ledger.trip("stale", 1800000002)
     ledger.close()
     ledger = Ledger(path, settings)
     assert ledger.summary()["circuit"] == "stale"
     with pytest.raises(Rejected, match="circuit"):
-        ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+        ledger.execute(
+            market,
+            make_book(),
+            Signal("Up", D("5"), D("0.53"), "test"),
+            1800000002,
+            clock=lambda: 1800000002,
+        )
 
 
 def test_multi_level_depth_fill_consumed_once(tmp_path):
@@ -82,11 +94,22 @@ def test_multi_level_depth_fill_consumed_once(tmp_path):
         "1800000002000",
         1800000002,
     )
-    result = ledger.execute(market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    result = ledger.execute(
+        market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002, clock=lambda: 1800000002
+    )
     assert result["levels"] == 2
     assert D(result["cost"]) == D("2.57")
     assert book.asks == {D("0.52"): D("2")}
-    assert ledger.execute(market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002) is None
+    assert (
+        ledger.execute(
+            market,
+            book,
+            Signal("Up", D("5"), D("0.53"), "test"),
+            1800000002,
+            clock=lambda: 1800000002,
+        )
+        is None
+    )
     assert ledger.summary()["fill_levels"] == 2
 
 
@@ -95,7 +118,13 @@ def test_daily_and_consecutive_loss_limits_survive_restart(tmp_path):
     settings = Settings(max_consecutive_losses=1)
     market = Market.from_event(event())
     ledger = Ledger(path, settings)
-    ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D("0.53"), "test"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     official = {
         "conditionId": "condition-1",
         "closed": True,
@@ -127,7 +156,13 @@ def test_daily_and_consecutive_loss_limits_survive_restart(tmp_path):
 def test_settlement_rejects_unknown_or_provisional_evidence(tmp_path, field, value):
     ledger = Ledger(tmp_path / "ledger.sqlite", Settings())
     market = Market.from_event(event())
-    ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D("0.53"), "test"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     official = {
         "conditionId": "condition-1",
         "closed": True,
@@ -146,7 +181,13 @@ def test_total_exposure_rejection_does_not_consume_depth(tmp_path):
     market = Market.from_event(event())
     book = make_book()
     with pytest.raises(Rejected, match="exposure"):
-        ledger.execute(market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+        ledger.execute(
+            market,
+            book,
+            Signal("Up", D("5"), D("0.53"), "test"),
+            1800000002,
+            clock=lambda: 1800000002,
+        )
     assert book.asks[D("0.51")] == D("10")
     assert ledger.summary()["cash"] == "1000"
     assert ledger.summary()["fills"] == 0
@@ -156,7 +197,13 @@ def test_daily_limit_reserves_worst_case_pending_and_new_debit(tmp_path):
     ledger = Ledger(tmp_path / "ledger.sqlite", Settings(daily_loss_limit=D("2.6")))
     market = Market.from_event(event())
     with pytest.raises(Rejected, match="daily"):
-        ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+        ledger.execute(
+            market,
+            make_book(),
+            Signal("Up", D("5"), D("0.53"), "test"),
+            1800000002,
+            clock=lambda: 1800000002,
+        )
     assert ledger.summary()["fills"] == 0
 
 
@@ -184,18 +231,32 @@ def test_sqlite_mid_transaction_failure_rolls_back_cash_order_and_depth(tmp_path
     import sqlite3
 
     with pytest.raises(sqlite3.IntegrityError, match="injected"):
-        ledger.execute(market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+        ledger.execute(
+            market,
+            book,
+            Signal("Up", D("5"), D("0.53"), "test"),
+            1800000002,
+            clock=lambda: 1800000002,
+        )
     assert ledger.summary()["cash"] == "1000"
     assert ledger.summary()["fills"] == 0
     assert book.asks[D("0.51")] == D("10")
     ledger.db.execute("DROP TRIGGER fail_fill")
-    assert ledger.execute(market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    assert ledger.execute(
+        market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002, clock=lambda: 1800000002
+    )
 
 
 def test_summary_cost_equity_fees_counters_and_audited_reset(tmp_path):
     ledger = Ledger(tmp_path / "ledger.sqlite", Settings())
     market = Market.from_event(event())
-    ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D("0.53"), "test"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     summary = ledger.summary()
     assert summary["total_fees"] == "0.08747"
     assert summary["pending_cost"] == "2.55"
@@ -213,7 +274,13 @@ def test_daily_realized_limit_trips_persistent_audited_circuit(tmp_path):
     settings = Settings(daily_loss_limit=D("2.63747"))
     ledger = Ledger(path, settings)
     market = Market.from_event(event())
-    ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D("0.53"), "test"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     official = {
         "conditionId": "condition-1",
         "closed": True,
@@ -233,7 +300,13 @@ def test_read_summary_is_read_only_and_consistent_with_open_writer(tmp_path):
     path = tmp_path / "ledger #1.sqlite"
     ledger = Ledger(path, Settings())
     market = Market.from_event(event())
-    ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D("0.53"), "test"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     before = path.stat().st_mtime_ns
     summary = Ledger.read_summary(path)
     assert summary == ledger.summary()
@@ -265,7 +338,13 @@ def test_has_order_persists_across_restart(tmp_path):
     ledger = Ledger(path, Settings())
     market = Market.from_event(event())
     assert not ledger.has_order(market.slug)
-    ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    ledger.execute(
+        market,
+        make_book(),
+        Signal("Up", D("5"), D("0.53"), "test"),
+        1800000002,
+        clock=lambda: 1800000002,
+    )
     assert ledger.has_order(market.slug)
     ledger.close()
     ledger = Ledger(path, Settings())
@@ -279,7 +358,13 @@ def test_execution_revalidates_depth_tick_even_if_book_reports_healthy(tmp_path,
     book.asks = {D("0.515"): D("10")}
     monkeypatch.setattr(book, "healthy", lambda *_: True)
     with pytest.raises(Rejected, match="tick"):
-        ledger.execute(market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+        ledger.execute(
+            market,
+            book,
+            Signal("Up", D("5"), D("0.53"), "test"),
+            1800000002,
+            clock=lambda: 1800000002,
+        )
     assert ledger.summary()["fills"] == 0
 
 
@@ -298,7 +383,11 @@ def test_newer_snapshot_minimum_is_respected(tmp_path):
     ledger = Ledger(tmp_path / "ledger.sqlite", Settings())
     with pytest.raises(Rejected, match="minimum"):
         ledger.execute(
-            Market.from_event(event()), book, Signal("Up", D("5"), D(".53"), "test"), 1800000002
+            Market.from_event(event()),
+            book,
+            Signal("Up", D("5"), D(".53"), "test"),
+            1800000002,
+            clock=lambda: 1800000002,
         )
     assert ledger.summary()["fills"] == 0
     ledger.close()

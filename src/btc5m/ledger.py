@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -325,21 +326,27 @@ class Ledger:
         now: float,
         *,
         audit: dict[str, Any] | None = None,
+        clock: Callable[[], float] | None = None,
+        continuity_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any] | None:
-        """Observe an attempt without changing its existing decision timestamp or checks."""
+        """Keep decision time as audit only; current injected clock governs execution."""
         audit = audit or {}
-        order_at = audit.get("order_at", now)
+        current_clock = clock or time.time
+        order_at = current_clock()
         order_quote = quote_snapshot(book, order_at, self.settings.stale_seconds)
         signal_quote = audit.get("signal_quote")
         signal_ask = signal_quote.get("best_ask") if signal_quote else None
         order_ask = order_quote["best_ask"]
-        context = {
+        context: dict[str, Any] = {
             "signal_id": audit.get("signal_id"),
             "order_id": None,
             "attempt_id": str(uuid4()),
             "signal_at": audit.get("signal_at"),
             "order_at": order_at,
             "decision_at": now,
+            "requested_order_at": audit.get("order_at"),
+            "continuity_epoch": audit.get("continuity_epoch"),
+            "continuity_sync_sequence": audit.get("continuity_sync_sequence"),
             "signal_quote": signal_quote,
             "order_quote": order_quote,
             "signal_to_order_move": str(number(order_ask) - number(signal_ask))
@@ -357,7 +364,9 @@ class Ledger:
         circuit = self._meta("circuit")
         try:
             with self.slow.measure("db.execute_transaction"):
-                result = self._execute(market, book, signal, now, context)
+                result = self._execute(
+                    market, book, signal, context, current_clock, continuity_check
+                )
         except BaseException as exc:
             # _execute has rolled back trading mutations. Each rejected attempt is
             # audited even if Service deduplicates its human-readable rejection log.
@@ -391,8 +400,46 @@ class Ledger:
         )
         return result
 
+    def _execution_check(
+        self,
+        market: Market,
+        book: Book,
+        clock: Callable[[], float],
+        continuity_check: Callable[[], bool] | None,
+        epoch: int | None = None,
+        sync_sequence: int | None = None,
+    ) -> float:
+        if continuity_check is not None and not continuity_check():
+            raise Rejected("continuity barrier or epoch mismatch")
+        if epoch is not None and (book.continuity_epoch != epoch or continuity_check is None):
+            raise Rejected("continuity book epoch mismatch")
+        if sync_sequence is not None and book.continuity_sync_sequence != sync_sequence:
+            raise Rejected("continuity subscription sequence mismatch")
+        current = clock()
+        if not market.start <= current < market.end - self.settings.min_time_remaining:
+            raise Rejected("outside entry window at execution")
+        if not quote_snapshot(book, current, self.settings.stale_seconds)["healthy"]:
+            raise Rejected("stale or disconnected execution quote")
+        if continuity_check is not None:
+            if not continuity_check():
+                raise Rejected("continuity barrier or epoch mismatch")
+            # The predicate can itself include filesystem checks. The final clock
+            # sample must follow those potentially blocking operations too.
+            current = clock()
+            if not market.start <= current < market.end - self.settings.min_time_remaining:
+                raise Rejected("outside entry window at final guard")
+            if not book.healthy(current, self.settings.stale_seconds):
+                raise Rejected("stale or disconnected execution quote at final guard")
+        return current
+
     def _execute(
-        self, market: Market, book: Book, signal: Signal, now: float, audit: dict[str, Any]
+        self,
+        market: Market,
+        book: Book,
+        signal: Signal,
+        audit: dict[str, Any],
+        clock: Callable[[], float],
+        continuity_check: Callable[[], bool] | None,
     ) -> dict[str, Any] | None:
         """All-or-none taker fill with a durable per-window successful entry allowance.
 
@@ -409,6 +456,17 @@ class Ledger:
             if circuit:
                 raise Rejected(f"circuit breaker active: {circuit}")
             settings = self.settings
+            now = self._execution_check(
+                market,
+                book,
+                clock,
+                continuity_check,
+                audit.get("continuity_epoch"),
+                audit.get("continuity_sync_sequence"),
+            )
+            audit["transaction_at"] = now
+            if not audit["order_quote"]["healthy"]:
+                raise Rejected("stale or disconnected order quote")
             if (
                 signal.outcome not in market.tokens
                 or market.tokens[signal.outcome] != book.asset_id
@@ -453,6 +511,28 @@ class Ledger:
             blocked = self.risk_blocked_reasons(debit, now)
             if blocked:
                 raise Rejected("; ".join(blocked))
+            now = self._execution_check(
+                market,
+                book,
+                clock,
+                continuity_check,
+                audit.get("continuity_epoch"),
+                audit.get("continuity_sync_sequence"),
+            )
+            blocked = self.risk_blocked_reasons(debit, now)
+            if blocked:
+                raise Rejected("; ".join(blocked))
+            # Risk/storage work itself may block; check again immediately before writes.
+            now = self._execution_check(
+                market,
+                book,
+                clock,
+                continuity_check,
+                audit.get("continuity_epoch"),
+                audit.get("continuity_sync_sequence"),
+            )
+            audit["execution_at"] = now
+            audit["execution_quote"] = quote_snapshot(book, now, settings.stale_seconds)
             cash = number(self._meta("cash"))
             entry = (
                 self.db.execute(
@@ -502,7 +582,48 @@ class Ledger:
                     cost / quantity - number(audit["order_quote"]["best_ask"])
                 ),
             }
-            self._event("paper_fill", result, audit["order_at"])
+            checked_at = self._execution_check(
+                market,
+                book,
+                clock,
+                continuity_check,
+                audit.get("continuity_epoch"),
+                audit.get("continuity_sync_sequence"),
+            )
+            # Own inserted exposure/cash are already reflected; do not reserve debit twice.
+            blocked = self.risk_blocked_reasons(ZERO, checked_at)
+            if blocked:
+                raise Rejected("; ".join(blocked))
+            result["commit_check_at"] = self._execution_check(
+                market,
+                book,
+                clock,
+                continuity_check,
+                audit.get("continuity_epoch"),
+                audit.get("continuity_sync_sequence"),
+            )
+            self._event("paper_fill", result, now)
+            # Even the audit INSERT can block. All SQL writes precede this final
+            # current-time/epoch gate; never authorize COMMIT using a pre-INSERT sample.
+            final_at = self._execution_check(
+                market,
+                book,
+                clock,
+                continuity_check,
+                audit.get("continuity_epoch"),
+                audit.get("continuity_sync_sequence"),
+            )
+            blocked = self.risk_blocked_reasons(ZERO, final_at)
+            if blocked:
+                raise Rejected("; ".join(blocked))
+            self._execution_check(
+                market,
+                book,
+                clock,
+                continuity_check,
+                audit.get("continuity_epoch"),
+                audit.get("continuity_sync_sequence"),
+            )
             self.db.commit()
         except BaseException:
             self.db.rollback()

@@ -162,6 +162,8 @@ class Market:
 
 class Book:
     def __init__(self, asset_id: str, tick: Decimal):
+        self.continuity_epoch: int | None = None
+        self.continuity_sync_sequence: int | None = None
         self.asset_id = asset_id
         self.tick = tick
         self.min_size: Decimal | None = None

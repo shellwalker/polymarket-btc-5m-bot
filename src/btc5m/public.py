@@ -6,7 +6,8 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from copy import copy
 from dataclasses import replace
 from decimal import Decimal
@@ -16,6 +17,7 @@ import httpx
 from websockets.asyncio.client import connect as ws_connect
 
 from .config import Settings
+from .continuity import ContinuityBarrier, ContinuityChanged
 from .domain import Book, Market, number, window_slugs
 from .reliability import CleanupIncomplete, OperationDeadline, Supervisor
 
@@ -207,16 +209,80 @@ class MarketStream:
         clock: Callable[[], float] = time.time,
         supervisor: Supervisor | None = None,
         progress: Callable[[str], None] | None = None,
+        continuity: ContinuityBarrier | None = None,
     ) -> None:
         self.settings, self.api, self.books = settings, api, books
         self.on_update, self.connect, self.clock = on_update, connect, clock
         self.supervisor = supervisor or Supervisor(settings.cleanup_seconds)
         self.progress = progress or (lambda phase: None)
+        self.continuity = continuity
+        self.epoch = continuity.epoch if continuity else 0
+        self.lease = object()
+        self.sync_started = False
+        self.sync_sequence = 0
+        self.session_closing = False
         self.retired = False
         self.reconnects = 0
         self.ready = False
         self.gap_started: float | None = None
         self.last_gap_seconds: float | None = None
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Any]:
+        manager = self.connect(
+            WS_URL,
+            ping_interval=None,
+            proxy=None,
+            open_timeout=self.settings.http_timeout,
+            close_timeout=2,
+            max_size=4 * 1024 * 1024,
+        )
+        ws = await manager.__aenter__()
+        self.session_closing = False
+
+        async def close(exc_type: Any, exc: Any, traceback: Any) -> Any:
+            self.session_closing = True
+            try:
+                result = await self.supervisor.run(
+                    manager.__aexit__(exc_type, exc, traceback),
+                    self.settings.cleanup_seconds,
+                    "ws.close",
+                )
+            except BaseException:
+                # Cancellation of close is not evidence the old subscription is gone.
+                self.supervisor.unsafe = True
+                self.retire()
+                raise
+            self.session_closing = False
+            return result
+
+        try:
+            yield ws
+        except BaseException as exc:
+            if not await close(type(exc), exc, exc.__traceback__):
+                raise
+        else:
+            await close(None, None, None)
+
+    def check_continuity(self) -> None:
+        if self.continuity is not None:
+            try:
+                self.continuity.require(self.epoch)
+                if self.sync_started and (
+                    self.continuity.owner is not self.lease
+                    or self.sync_sequence != self.continuity.sync_sequence
+                ):
+                    raise ContinuityChanged("subscription lease replaced")
+            except ContinuityChanged:
+                self.retire()
+                for book in self.books.values():
+                    book.bids.clear()
+                    book.asks.clear()
+                    book.continuity_epoch = None
+                    book.continuity_sync_sequence = None
+                raise
+        if self.retired:
+            raise ContinuityChanged("retired subscription generation")
 
     def retire(self) -> None:
         self.retired = True
@@ -249,6 +315,7 @@ class MarketStream:
     ) -> None:
         if self.retired:
             return
+        self.check_continuity()
         book = self.books[token]
         if initial:
             # WS initial dump is its own ordered baseline, not a merge into a
@@ -263,10 +330,15 @@ class MarketStream:
             if "tick_size" in snapshot:
                 book.change_tick(snapshot["tick_size"])
         book.snapshot(snapshot, self.clock())
+        self.check_continuity()
+        if initial:
+            book.continuity_epoch = self.epoch
+            book.continuity_sync_sequence = self.sync_sequence
 
     def apply_price_change(self, message: dict[str, Any], pending: set[str]) -> None:
         if self.retired:
             return
+        self.check_continuity()
         grouped: dict[str, list[dict[str, Any]]] = {}
         staged: dict[str, Book] = {}
         try:
@@ -281,6 +353,7 @@ class MarketStream:
                 candidate.connected = True  # This token's initial dump is complete.
                 candidate.deltas(changes, message["timestamp"], self.clock())
                 staged[asset] = candidate
+            self.check_continuity()
             for asset, candidate in staged.items():
                 book = self.books[asset]
                 book.bids, book.asks = candidate.bids, candidate.asks
@@ -295,26 +368,31 @@ class MarketStream:
             while not stop.is_set() and not self.retired and not self.supervisor.unsafe:
                 self.invalidate()
                 try:
+                    self.check_continuity()
+                    self.lease = object()
+                    if self.continuity is not None:
+                        self.continuity.begin(self.lease, set(self.books))
+                        self.sync_sequence = self.continuity.sync_sequence
+                        self.sync_started = True
+                        self.check_continuity()
+                        for book in self.books.values():
+                            book.continuity_epoch = None
+                            book.continuity_sync_sequence = None
                     snapshots = await self.bounded(
                         asyncio.gather(*(self.api.snapshot(t) for t in self.books)),
                         self.settings.ws_sync_seconds,
                         "ws.rest_sync",
                     )
-                    if self.retired or stop.is_set():
+                    self.check_continuity()
+                    if stop.is_set():
                         return
                     for initial_token, snapshot in zip(self.books, snapshots, strict=True):
                         self.books[initial_token].source_time = 0
                         self.apply_snapshot(initial_token, snapshot)
                         self.books[initial_token].connected = False
-                    async with self.connect(
-                        WS_URL,
-                        ping_interval=None,
-                        proxy=None,
-                        open_timeout=self.settings.http_timeout,
-                        close_timeout=2,
-                        max_size=4 * 1024 * 1024,
-                    ) as ws:
-                        if self.retired or stop.is_set():
+                    async with self.connection() as ws:
+                        self.check_continuity()
+                        if stop.is_set():
                             return
                         await self.bounded(
                             ws.send(
@@ -330,7 +408,8 @@ class MarketStream:
                             self.settings.ws_send_seconds,
                             "ws.subscribe",
                         )
-                        if self.retired or stop.is_set():
+                        self.check_continuity()
+                        if stop.is_set():
                             return
                         pending = set(self.books)
                         loop = asyncio.get_running_loop()
@@ -343,6 +422,7 @@ class MarketStream:
                         receive = asyncio.create_task(ws.recv())
                         try:
                             while not stop.is_set() and not self.retired:
+                                self.check_continuity()
                                 now = loop.time()
                                 if pending and now >= sync_deadline:
                                     raise OperationDeadline(
@@ -371,6 +451,7 @@ class MarketStream:
                                         )
                                     wait_seconds = min(wait_seconds, remaining)
                                 done, _ = await asyncio.wait({receive}, timeout=wait_seconds)
+                                self.check_continuity()
                                 if not done:
                                     continue
                                 if self.retired or stop.is_set():
@@ -414,7 +495,20 @@ class MarketStream:
                                     raise OperationDeadline(
                                         "initial WS snapshot synchronization deadline"
                                     )
+                                self.check_continuity()
                                 was_ready = self.ready
+                                if not pending and not was_ready and self.continuity is not None:
+                                    # Do not publish readiness until the complete current-epoch
+                                    # WS dump is fresh on both tokens (REST alone never opens).
+                                    for book in self.books.values():
+                                        book.connected = True
+                                    if not self.continuity.complete(
+                                        self.epoch, self.lease, self.books, self.clock()
+                                    ):
+                                        self.invalidate()
+                                        raise ValueError(
+                                            "current-epoch dual-token resync incomplete"
+                                        )
                                 self.ready = not pending
                                 if self.ready and not was_ready:
                                     self.supervisor.record_operation(
@@ -490,6 +584,9 @@ class MarketStream:
                 except CleanupIncomplete:
                     self.retire()
                     raise
+                except ContinuityChanged:
+                    self.retire()
+                    return
                 except Exception as exc:
                     self.reconnects += 1
                     self.invalidate()
