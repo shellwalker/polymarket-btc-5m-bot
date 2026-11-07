@@ -17,6 +17,7 @@ from websockets.asyncio.client import connect as ws_connect
 
 from .config import Settings
 from .domain import Book, Market, number, window_slugs
+from .reliability import CleanupIncomplete, OperationDeadline, Supervisor
 
 LOG = logging.getLogger(__name__)
 BASES = {
@@ -30,8 +31,52 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 class PublicAPI:
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self.settings, self.client = settings, client
+        self.supervisor = Supervisor(settings.cleanup_seconds)
+
+    def total_expired(self, service: str, path: str, started: float) -> OperationDeadline:
+        LOG.warning(
+            "operation_deadline",
+            extra={
+                "details": {
+                    "operation": "http.total",
+                    "service": service,
+                    "path": path,
+                    "budget_seconds": self.settings.http_total_seconds,
+                    "elapsed_seconds": asyncio.get_running_loop().time() - started,
+                    "operation_elapsed_seconds": None,
+                    "cleanup_elapsed_seconds": None,
+                    "timing_scope": "overall including retries/backoff; cleanup per attempt",
+                }
+            },
+        )
+        return OperationDeadline("HTTP overall retry budget exceeded")
 
     async def get(self, service: str, path: str, **params: str) -> Any:
+        started = asyncio.get_running_loop().time()
+        outcome = "error"
+        try:
+            result = await self._get(service, path, **params)
+            outcome = "success"
+            return result
+        except OperationDeadline:
+            outcome = "timeout"
+            raise
+        except CleanupIncomplete:
+            outcome = "cleanup_incomplete"
+            raise
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            self.supervisor.record_operation(
+                "http.total",
+                asyncio.get_running_loop().time() - started,
+                outcome,
+                budget_seconds=self.settings.http_total_seconds,
+                cleanup_elapsed_seconds=None,
+            )
+
+    async def _get(self, service: str, path: str, **params: str) -> Any:
         allowed = (
             (service == "gamma" and path == "/events")
             or (service == "geo" and path == "/api/geoblock")
@@ -45,30 +90,47 @@ class PublicAPI:
         )
         if not allowed:
             raise ValueError("public endpoint not allowlisted")
+        started = asyncio.get_running_loop().time()
+        deadline = started + self.settings.http_total_seconds
         delay = self.settings.retry_initial
         for attempt in range(4):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise self.total_expired(service, path, started)
             try:
-                response = await self.client.get(
-                    BASES[service] + path,
-                    params=params,
-                    timeout=self.settings.http_timeout,
-                    follow_redirects=False,
+                response = await self.supervisor.run(
+                    self.client.get(
+                        BASES[service] + path,
+                        params=params,
+                        timeout=self.settings.http_timeout,
+                        follow_redirects=False,
+                    ),
+                    min(remaining, self.settings.http_response_seconds),
+                    "http.complete_response",
                 )
                 response.raise_for_status()
-                return response.json()
+                result = response.json()
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise OperationDeadline("HTTP overall budget exceeded during decode")
+                return result
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code != 429 and exc.response.status_code < 500:
                     raise
                 if attempt == 3:
                     raise
-            except httpx.TransportError:
+            except (httpx.TransportError, OperationDeadline):
                 if attempt == 3:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise self.total_expired(service, path, started) from None
                     raise
             LOG.warning(
                 "http_retry",
                 extra={"details": {"service": service, "path": path, "attempt": attempt + 1}},
             )
-            await asyncio.sleep(delay)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise self.total_expired(service, path, started)
+            await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, self.settings.retry_max)
         raise AssertionError("unreachable")
 
@@ -143,13 +205,35 @@ class MarketStream:
         *,
         connect: Any = ws_connect,
         clock: Callable[[], float] = time.time,
+        supervisor: Supervisor | None = None,
+        progress: Callable[[str], None] | None = None,
     ) -> None:
         self.settings, self.api, self.books = settings, api, books
         self.on_update, self.connect, self.clock = on_update, connect, clock
+        self.supervisor = supervisor or Supervisor(settings.cleanup_seconds)
+        self.progress = progress or (lambda phase: None)
+        self.retired = False
         self.reconnects = 0
         self.ready = False
         self.gap_started: float | None = None
         self.last_gap_seconds: float | None = None
+
+    def retire(self) -> None:
+        self.retired = True
+        self.ready = False
+        for book in self.books.values():
+            book.disconnect()
+
+    async def bounded(self, operation: Any, seconds: float, label: str) -> Any:
+        self.progress(label)
+        try:
+            return await self.supervisor.run(operation, seconds, label)
+        except CleanupIncomplete:
+            self.retire()
+            raise
+        except OperationDeadline:
+            self.invalidate()
+            raise
 
     def invalidate(self) -> None:
         self.ready = False
@@ -157,11 +241,14 @@ class MarketStream:
             self.gap_started = self.clock()
         for book in self.books.values():
             book.disconnect()
-        self.on_update()
+        if not self.retired:
+            self.on_update()
 
     def apply_snapshot(
         self, token: str, snapshot: dict[str, Any], *, initial: bool = False
     ) -> None:
+        if self.retired:
+            return
         book = self.books[token]
         if initial:
             # WS initial dump is its own ordered baseline, not a merge into a
@@ -178,6 +265,8 @@ class MarketStream:
         book.snapshot(snapshot, self.clock())
 
     def apply_price_change(self, message: dict[str, Any], pending: set[str]) -> None:
+        if self.retired:
+            return
         grouped: dict[str, list[dict[str, Any]]] = {}
         staged: dict[str, Book] = {}
         try:
@@ -203,10 +292,16 @@ class MarketStream:
     async def run(self, stop: asyncio.Event) -> None:
         delay = self.settings.retry_initial
         try:
-            while not stop.is_set():
+            while not stop.is_set() and not self.retired and not self.supervisor.unsafe:
                 self.invalidate()
                 try:
-                    snapshots = await asyncio.gather(*(self.api.snapshot(t) for t in self.books))
+                    snapshots = await self.bounded(
+                        asyncio.gather(*(self.api.snapshot(t) for t in self.books)),
+                        self.settings.ws_sync_seconds,
+                        "ws.rest_sync",
+                    )
+                    if self.retired or stop.is_set():
+                        return
                     for initial_token, snapshot in zip(self.books, snapshots, strict=True):
                         self.books[initial_token].source_time = 0
                         self.apply_snapshot(initial_token, snapshot)
@@ -219,35 +314,68 @@ class MarketStream:
                         close_timeout=2,
                         max_size=4 * 1024 * 1024,
                     ) as ws:
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "assets_ids": list(self.books),
-                                    "type": "market",
-                                    "custom_feature_enabled": True,
-                                    "initial_dump": True,
-                                }
-                            )
+                        if self.retired or stop.is_set():
+                            return
+                        await self.bounded(
+                            ws.send(
+                                json.dumps(
+                                    {
+                                        "assets_ids": list(self.books),
+                                        "type": "market",
+                                        "custom_feature_enabled": True,
+                                        "initial_dump": True,
+                                    }
+                                )
+                            ),
+                            self.settings.ws_send_seconds,
+                            "ws.subscribe",
                         )
+                        if self.retired or stop.is_set():
+                            return
                         pending = set(self.books)
                         loop = asyncio.get_running_loop()
                         connected_since = loop.time()
+                        sync_deadline = connected_since + self.settings.ws_sync_seconds
+                        sync_recorded = False
+                        sync_outcome = "cancelled"
                         last_pong = loop.time()
                         next_ping = loop.time() + self.settings.heartbeat_seconds
                         receive = asyncio.create_task(ws.recv())
                         try:
-                            while not stop.is_set():
+                            while not stop.is_set() and not self.retired:
                                 now = loop.time()
+                                if pending and now >= sync_deadline:
+                                    raise OperationDeadline(
+                                        "initial WS snapshot synchronization deadline"
+                                    )
                                 if now - last_pong > self.settings.pong_timeout:
                                     raise TimeoutError("application PONG timeout")
                                 if now >= next_ping:
-                                    await ws.send("PING")
+                                    await self.bounded(
+                                        ws.send("PING"),
+                                        min(
+                                            self.settings.ws_send_seconds,
+                                            max(0.0, sync_deadline - loop.time()),
+                                        )
+                                        if pending
+                                        else self.settings.ws_send_seconds,
+                                        "ws.ping",
+                                    )
                                     next_ping = now + self.settings.heartbeat_seconds
-                                done, _ = await asyncio.wait(
-                                    {receive}, timeout=min(0.25, self.settings.heartbeat_seconds)
-                                )
+                                wait_seconds = min(0.25, self.settings.heartbeat_seconds)
+                                if pending:
+                                    remaining = sync_deadline - loop.time()
+                                    if remaining <= 0:
+                                        raise OperationDeadline(
+                                            "initial WS snapshot synchronization deadline"
+                                        )
+                                    wait_seconds = min(wait_seconds, remaining)
+                                done, _ = await asyncio.wait({receive}, timeout=wait_seconds)
                                 if not done:
                                     continue
+                                if self.retired or stop.is_set():
+                                    return
+                                self.progress("ws.received")
                                 raw = receive.result()
                                 receive = asyncio.create_task(ws.recv())
                                 if raw == "PONG":
@@ -282,9 +410,20 @@ class MarketStream:
                                         "tick_size_change",
                                     }:
                                         raise ValueError(f"unknown websocket event: {kind}")
+                                if not sync_recorded and loop.time() >= sync_deadline:
+                                    raise OperationDeadline(
+                                        "initial WS snapshot synchronization deadline"
+                                    )
                                 was_ready = self.ready
                                 self.ready = not pending
                                 if self.ready and not was_ready:
+                                    self.supervisor.record_operation(
+                                        "ws.initial_sync",
+                                        loop.time() - connected_since,
+                                        "success",
+                                        budget_seconds=self.settings.ws_sync_seconds,
+                                    )
+                                    sync_recorded = True
                                     self.last_gap_seconds = (
                                         self.clock() - self.gap_started
                                         if self.gap_started is not None
@@ -305,11 +444,51 @@ class MarketStream:
                                     book.connected = self.ready and asset not in pending
                                 if self.ready and loop.time() - connected_since >= 30:
                                     delay = self.settings.retry_initial
-                                self.on_update()
+                                if not self.retired:
+                                    self.on_update()
+                        except OperationDeadline:
+                            sync_outcome = "timeout"
+                            raise
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            sync_outcome = "error"
+                            raise
                         finally:
-                            receive.cancel()
-                            await asyncio.gather(receive, return_exceptions=True)
+                            phase_elapsed = loop.time() - connected_since
+                            sync_timed_out = not sync_recorded and loop.time() >= sync_deadline
+                            if not sync_recorded:
+                                self.invalidate()
+                            cleanup_started = loop.time()
+                            clean = False
+                            try:
+                                clean = await self.supervisor.cancel(
+                                    [receive], "ws.receive_cleanup"
+                                )
+                            finally:
+                                if not sync_recorded:
+                                    self.supervisor.record_operation(
+                                        "ws.initial_sync",
+                                        loop.time() - connected_since,
+                                        (
+                                            "cleanup_incomplete"
+                                            if not clean
+                                            else "timeout"
+                                            if sync_timed_out
+                                            else sync_outcome
+                                        ),
+                                        operation_elapsed_seconds=phase_elapsed,
+                                        cleanup_elapsed_seconds=loop.time() - cleanup_started,
+                                        budget_seconds=self.settings.ws_sync_seconds,
+                                        log_deadline=sync_timed_out,
+                                    )
+                            if not clean:
+                                self.retire()
+                                raise CleanupIncomplete("WS receive did not cancel")
                 except asyncio.CancelledError:
+                    raise
+                except CleanupIncomplete:
+                    self.retire()
                     raise
                 except Exception as exc:
                     self.reconnects += 1

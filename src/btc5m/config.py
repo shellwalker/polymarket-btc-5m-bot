@@ -53,6 +53,16 @@ class Settings:
     pong_timeout: float = 20.0
     equity_snapshot_seconds: float = 15.0
     valuation_stale_seconds: float = 5.0
+    diagnostic_heartbeat_seconds: float = 15.0
+    continuity_gap_seconds: float = 30.0
+    clock_tolerance_seconds: float = 2.0
+    http_response_seconds: float = 15.0
+    http_total_seconds: float = 60.0
+    ws_sync_seconds: float = 65.0
+    ws_send_seconds: float = 5.0
+    cleanup_seconds: float = 3.0
+    slow_operation_seconds: float = 0.1
+    slow_diagnostic_throttle_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if self.live:

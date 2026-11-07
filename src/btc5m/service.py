@@ -19,6 +19,7 @@ from .config import Settings
 from .domain import ZERO, Book, Market, MomentumStrategy, fee, number
 from .ledger import Ledger, Rejected
 from .public import MarketStream
+from .reliability import Diagnostics, SlowOperations, Supervisor
 from .telemetry import RUN_ID, current_run_id, quote_snapshot
 
 LOG = logging.getLogger(__name__)
@@ -91,9 +92,19 @@ class Service:
         clock: Callable[[], float] = time.time,
         connect: Any = None,
         run_id: str | None = None,
+        diagnostics: Diagnostics | None = None,
     ) -> None:
         self.settings, self.api, self.clock = settings, api, clock
         self.run_id = run_id or current_run_id()
+        self.diagnostics = diagnostics or Diagnostics(settings)
+        self.slow = SlowOperations(
+            settings.slow_operation_seconds, settings.slow_diagnostic_throttle_seconds
+        )
+        self.supervisor = getattr(api, "supervisor", None) or Supervisor(settings.cleanup_seconds)
+        self.generation = 0
+        self.cleanup_failed = False
+        self.closing = False
+        self.switch_lock = asyncio.Lock()
         self.valuation_books: dict[str, Book] = {}
         self.next_equity_at = float("-inf")
         self.connect = connect
@@ -120,9 +131,55 @@ class Service:
         if self.ledger is not None:
             self.ledger.event(kind, details, self.clock())
 
+    def retire_stream(self) -> None:
+        if isinstance(self.stream, MarketStream):
+            self.stream.retire()
+        for book in self.books.values():
+            book.disconnect()
+
+    def fail_closed(self, reason: str) -> None:
+        if self.cleanup_failed:
+            return
+        self.cleanup_failed = True
+        self.generation += 1
+        self.retire_stream()
+        self.market = None
+        try:
+            self.record(
+                "reliability_halted",
+                {
+                    "reason": reason,
+                    "generation": self.generation,
+                    "limitation": "No replacement subscriptions; pending cleanup cannot be forced",
+                },
+            )
+        except Exception:
+            LOG.exception("reliability_halt_audit_failed")
+
+    def emit_heartbeat(self) -> None:
+        beat, gap = self.diagnostics.heartbeat(self.run_id)
+        if beat is None:
+            return
+        for kind, details in [("heartbeat", beat), ("continuity_gap", gap)]:
+            if details is None:
+                continue
+            LOG.info(kind, extra={"details": details})
+            if self.ledger is not None:
+                self.ledger.event(kind, details, beat["clocks"]["wall"])
+
+    async def periodic_diagnostics(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            self.diagnostics.progress("diagnostics", "heartbeat")
+            self.emit_heartbeat()
+            await self.pause(stop, min(1.0, self.settings.diagnostic_heartbeat_seconds))
+
     def update(self) -> None:
         # The same event is set by SIGTERM/SIGINT; guard before any ledger mutation.
         if self.stop.is_set() or (self.settings.runtime_dir / "STOP").exists():
+            return
+        if self.supervisor.unsafe:
+            self.fail_closed("incomplete_task_cleanup")
+        if self.cleanup_failed or self.closing:
             return
         if self.ledger is None or self.market is None or self.switching:
             return
@@ -211,6 +268,14 @@ class Service:
                 self.last_rejection = reason
 
     async def switch(self, market: Market | None) -> None:
+        async with self.switch_lock:
+            if self.supervisor.unsafe:
+                self.fail_closed("incomplete_task_cleanup")
+            if self.cleanup_failed or self.closing:
+                return
+            await self._switch(market)
+
+    async def _switch(self, market: Market | None) -> None:
         if market is not None and self.known_market is not None:
             known = self.known_market
             if market.slug == known.slug:
@@ -222,7 +287,7 @@ class Service:
                 ):
                     if self.ledger is not None:
                         self.ledger.trip("market_identity_changed", self.clock())
-                    await self.switch(None)
+                    await self._switch(None)
                     raise ValueError("same-window market identity changed")
                 if self.market is not None:
                     # Polling metadata can lag WS dynamic ticks. Refresh constraints
@@ -232,11 +297,19 @@ class Service:
         if market is not None:
             self.known_market = market
         self.switching = True
+        self.generation += 1
+        generation = self.generation
+        self.retire_stream()
         try:
             self.stream_stop.set()
             if self.stream_task is not None:
-                self.stream_task.cancel()
-                await asyncio.gather(self.stream_task, return_exceptions=True)
+                self.diagnostics.progress("stream", "cancelling")
+                if not await self.supervisor.cancel([self.stream_task], "service.stream_cancel"):
+                    self.fail_closed("stream_cancel_budget_exceeded")
+                    return
+            if self.supervisor.unsafe:
+                self.fail_closed("incomplete_task_cleanup")
+                return
             if self.stream is not None:
                 self.prior_reconnects += self.stream.reconnects
             self.market, self.books, self.stream = market, {}, None
@@ -252,8 +325,20 @@ class Service:
             self.books = {token: Book(token, market.tick) for token in market.tokens.values()}
             self.stream_stop = asyncio.Event()
             kwargs = {} if self.connect is None else {"connect": self.connect}
+
+            def update_generation() -> None:
+                if generation == self.generation and not self.cleanup_failed and not self.closing:
+                    self.update()
+
             self.stream = MarketStream(
-                self.settings, self.api, self.books, self.update, clock=self.clock, **kwargs
+                self.settings,
+                self.api,
+                self.books,
+                update_generation,
+                clock=self.clock,
+                supervisor=self.supervisor,
+                progress=lambda phase: self.diagnostics.progress("stream", phase),
+                **kwargs,
             )
             self.stream_task = asyncio.create_task(self.stream.run(self.stream_stop))
             self.record("market_switch", {"slug": market.slug, "end": market.end})
@@ -302,43 +387,54 @@ class Service:
         summary = self.ledger.summary() if self.ledger is not None else {}
         risk_blocked = self.risk_blocked_reasons(now)
         equity = self.ledger.latest_equity() if self.ledger else None
-        atomic_json(
-            self.settings.runtime_dir / "health.json",
-            {
-                "updated": now,
-                "run_id": self.run_id,
-                "equity_snapshot": equity,
-                "equity_snapshot_age_seconds": now - equity["created"] if equity else None,
-                "equity_snapshot_overdue": bool(
-                    equity and now - equity["created"] > self.settings.equity_snapshot_seconds
-                ),
-                "pid": os.getpid(),
-                "mode": "paper",
-                "stopped": stopped,
-                "market": self.market.slug if self.market else None,
-                "next_market": self.next_market.slug if self.next_market else None,
-                "connected": self.stream.ready if self.stream else False,
-                "trading_ready": bool(
-                    healthy
-                    and not self.stop.is_set()
-                    and not risk_blocked
-                    and not summary.get("circuit")
-                    and not (self.settings.runtime_dir / "STOP").exists()
-                    and self.market is not None
-                    and self.market.start
-                    <= now
-                    < self.market.end - self.settings.min_time_remaining
-                ),
-                "risk_blocked_reasons": risk_blocked,
-                **self.settings.fee_assumption(),
-                "geoblock": self.geo,
-                "reconnects": self.prior_reconnects
-                + (self.stream.reconnects if self.stream else 0),
-                "gap_started": self.stream.gap_started if self.stream else None,
-                "last_gap_seconds": self.stream.last_gap_seconds if self.stream else None,
-                "summary": summary,
-            },
-        )
+        with self.slow.measure("health.write"):
+            atomic_json(
+                self.settings.runtime_dir / "health.json",
+                {
+                    "updated": now,
+                    "run_id": self.run_id,
+                    "reliability": {
+                        "heartbeat": self.diagnostics.latest,
+                        "workers": self.diagnostics.workers,
+                        "generation": self.generation,
+                        "cleanup_failed": self.cleanup_failed,
+                        "owned_pending_tasks": len(self.supervisor.pending),
+                        "operation_durations": self.supervisor.operation_durations,
+                        "cleanup_durations": self.supervisor.cleanup_durations,
+                        "slow_operations": self.slow.stats,
+                    },
+                    "equity_snapshot": equity,
+                    "equity_snapshot_age_seconds": now - equity["created"] if equity else None,
+                    "equity_snapshot_overdue": bool(
+                        equity and now - equity["created"] > self.settings.equity_snapshot_seconds
+                    ),
+                    "pid": os.getpid(),
+                    "mode": "paper",
+                    "stopped": stopped,
+                    "market": self.market.slug if self.market else None,
+                    "next_market": self.next_market.slug if self.next_market else None,
+                    "connected": self.stream.ready if self.stream else False,
+                    "trading_ready": bool(
+                        healthy
+                        and not self.stop.is_set()
+                        and not risk_blocked
+                        and not summary.get("circuit")
+                        and not (self.settings.runtime_dir / "STOP").exists()
+                        and self.market is not None
+                        and self.market.start
+                        <= now
+                        < self.market.end - self.settings.min_time_remaining
+                    ),
+                    "risk_blocked_reasons": risk_blocked,
+                    **self.settings.fee_assumption(),
+                    "geoblock": self.geo,
+                    "reconnects": self.prior_reconnects
+                    + (self.stream.reconnects if self.stream else 0),
+                    "gap_started": self.stream.gap_started if self.stream else None,
+                    "last_gap_seconds": self.stream.last_gap_seconds if self.stream else None,
+                    "summary": summary,
+                },
+            )
 
     def snapshot_equity_if_due(self) -> None:
         if self.ledger is None:
@@ -366,6 +462,8 @@ class Service:
             async with semaphore:
                 try:
                     raw = await self.api.snapshot(token)
+                    if self.cleanup_failed or self.closing:
+                        return
                     book = Book(token, number(tick))
                     # Use the public snapshot's tick when present, otherwise the verified
                     # persisted market tick. No mutation of Service.books or stream state.
@@ -385,8 +483,13 @@ class Service:
 
     async def periodic_valuation_quotes(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
+            if self.cleanup_failed or self.closing:
+                await self.pause(stop, 0.25)
+                continue
+            self.diagnostics.progress("valuation", "refresh")
             try:
                 await self.refresh_valuation_quotes()
+                self.diagnostics.progress("valuation", "waiting")
             except Exception:
                 LOG.exception("valuation_refresh_error", extra={"details": {"run_id": self.run_id}})
             await self.pause(
@@ -404,6 +507,8 @@ class Service:
                 continue
             try:
                 official = await self.api.resolution(market)
+                if self.cleanup_failed or self.closing:
+                    return
                 result = self.ledger.settle(market, official, self.clock())
                 if result:
                     LOG.info("settlement", extra={"details": result})
@@ -414,8 +519,15 @@ class Service:
 
     async def periodic_discovery(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
+            if self.cleanup_failed or self.closing:
+                await self.pause(stop, 0.25)
+                continue
             try:
+                self.diagnostics.progress("discovery", "request")
                 current, following = await self.api.discover(self.clock())
+                if self.cleanup_failed or self.closing:
+                    return
+                self.diagnostics.progress("discovery", "received")
                 self.next_market = following
                 # A failed refresh invalidates a previously tradable market too.
                 if current is None:
@@ -430,7 +542,12 @@ class Service:
 
     async def periodic_resolution(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
+            if self.cleanup_failed or self.closing:
+                await self.pause(stop, 0.25)
+                continue
+            self.diagnostics.progress("resolution", "request")
             await self.resolve_pending()
+            self.diagnostics.progress("resolution", "waiting")
             await self.pause(stop, self.settings.resolution_seconds)
 
     @staticmethod
@@ -460,13 +577,19 @@ class Service:
         settings = self.settings
         with RuntimeLock(settings.runtime_dir):
             self.ledger = Ledger(
-                settings.runtime_dir / "ledger.sqlite3", settings, run_id=self.run_id
+                settings.runtime_dir / "ledger.sqlite3",
+                settings,
+                run_id=self.run_id,
+                slow=self.slow,
             )
             tasks: list[asyncio.Task[None]] = []
             try:
                 if (settings.runtime_dir / "STOP").exists() or stop.is_set():
                     self.record("startup_stopped", {})
                     return
+                self.diagnostics.progress("main", "startup")
+                self.emit_heartbeat()
+                tasks.append(asyncio.create_task(self.periodic_diagnostics(stop)))
                 geo_task = asyncio.create_task(self.api.get("geo", "/api/geoblock"))
                 stop_task = asyncio.create_task(self.wait_stop(stop))
                 try:
@@ -483,16 +606,21 @@ class Service:
                         self.geo = {"blocked": "unknown", "error": str(exc)}
                         self.record("geoblock_unavailable", self.geo)
                 finally:
-                    geo_task.cancel()
-                    stop_task.cancel()
-                    await asyncio.gather(geo_task, stop_task, return_exceptions=True)
-                tasks = [
-                    asyncio.create_task(self.periodic_discovery(stop)),
-                    asyncio.create_task(self.periodic_resolution(stop)),
-                    asyncio.create_task(self.periodic_valuation_quotes(stop)),
-                ]
+                    if not await self.supervisor.cancel([geo_task, stop_task], "startup.cleanup"):
+                        self.fail_closed("startup_cleanup_incomplete")
+                tasks.extend(
+                    [
+                        asyncio.create_task(self.periodic_discovery(stop)),
+                        asyncio.create_task(self.periodic_resolution(stop)),
+                        asyncio.create_task(self.periodic_valuation_quotes(stop)),
+                    ]
+                )
                 self.record("service_started", {"mode": "paper", **settings.fee_assumption()})
                 while not stop.is_set():
+                    self.diagnostics.progress("main", "loop")
+                    self.emit_heartbeat()
+                    if self.supervisor.unsafe:
+                        self.fail_closed("incomplete_task_cleanup")
                     if (settings.runtime_dir / "STOP").exists():
                         self.record("emergency_stop", {"source": "file_or_command"})
                         stop.set()
@@ -504,17 +632,55 @@ class Service:
                     self.snapshot_equity_if_due()
                     self.health()
                     for task in tasks:
-                        if task.done():
+                        if task.done() and not self.cleanup_failed and not stop.is_set():
                             task.result()
                             raise RuntimeError("background worker exited unexpectedly")
                     await self.pause(stop, 0.25)
             finally:
-                self.switching = True
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                await self.switch(None)
-                self.record("service_stopped", {})
+                self.closing = self.switching = True
+                self.generation += 1
+                self.retire_stream()
+                self.stream_stop.set()
+                shutdown = asyncio.create_task(self.finish_shutdown(tasks))
+                # A second cancellation must not release the runtime lock while old
+                # subscriptions can still exist. Cleanup itself owns bounded waits.
+                while not shutdown.done():
+                    try:
+                        await asyncio.shield(shutdown)
+                    except asyncio.CancelledError:
+                        self.fail_closed("shutdown_cancelled_while_cleanup_pending")
+                shutdown.result()
+
+    async def finish_shutdown(self, tasks: list[asyncio.Task[None]]) -> None:
+        assert self.ledger is not None
+        cleanup = list(tasks)
+        if self.stream_task is not None:
+            cleanup.append(self.stream_task)
+        try:
+            await self.supervisor.cancel(cleanup, "service.shutdown")
+        except asyncio.CancelledError:
+            self.fail_closed("shutdown_cleanup_cancelled")
+        # Keep the runtime lock and DB while uncooperative work remains. A
+        # timeout is not proof that its subscription/socket/worker is gone.
+        if self.supervisor.pending:
+            self.fail_closed("shutdown_cleanup_incomplete")
+        reported = False
+        while self.supervisor.pending:
+            try:
+                self.emit_heartbeat()
                 self.health(stopped=True)
-                self.ledger.close()
-                self.ledger = None
+            except Exception:
+                if not reported:
+                    LOG.exception("quarantine_diagnostics_failed")
+                    reported = True
+            try:
+                await asyncio.wait(list(self.supervisor.pending), timeout=1.0)
+            except asyncio.CancelledError:
+                self.fail_closed("shutdown_cleanup_cancelled")
+        self.market, self.books, self.stream = None, {}, None
+        try:
+            self.record("service_stopped", {})
+            self.health(stopped=True)
+        finally:
+            self.ledger.close()
+            self.ledger = None

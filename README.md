@@ -28,6 +28,17 @@ live = false
 runtime_dir = "runtime"
 equity_snapshot_seconds = 15
 valuation_stale_seconds = 5
+# 独立的可靠性/网络预算，不改变交易阈值
+diagnostic_heartbeat_seconds = 15
+continuity_gap_seconds = 30
+clock_tolerance_seconds = 2
+http_response_seconds = 15
+http_total_seconds = 60
+ws_sync_seconds = 65
+ws_send_seconds = 5
+cleanup_seconds = 3
+slow_operation_seconds = 0.1
+slow_diagnostic_throttle_seconds = 60
 initial_cash = "1000"
 max_trade = "10"
 max_exposure = "50"
@@ -131,6 +142,48 @@ uv run --locked btc5m stats --run-id legacy
 升级前已活跃熔断的历史起点无法确定：`started/start_run_id/duration_seconds` 保持 `null`，只记录升级后 `observed_since` 和新尝试计数，不扫描旧事件推测起点/次数。已知区间的持续时间是持久熔断墙钟时间，包含进程停机时段；仍活跃时显示截至 `duration_as_of` 的时长。统计按区间与时间范围重叠及进程参与筛选；区间完整生命周期的 `rejected_signals/duration_seconds` 与范围内 `selected_rejected_signals` 分列，不把跨范围总数伪装成局部计数。
 
 写入端识别 v1 后，将表结构以单个事务幂等升级至 **schema_version=2**：新增可空 `events.run_id`、索引和权益/熔断观测表，保留所有旧金额、订单、成交、结算和事件内容；DDL失败则回滚整个升级。未知未来版本在任何DDL/写入及WAL模式修改之前拒绝。只读命令不会升级；v2账本需要支持v2的写入程序，不能由旧v1程序继续写入。迁移仅由后续获准运行的新写入进程执行，文档中的统计命令不会重启当前服务。
+
+## 最小可靠性诊断与请求期限
+
+历史 **2026-11-07 10:57–11:21 PST 约24分钟记录空白的根因仍为 UNKNOWN**。事件循环/同步I/O阻塞、进程调度停顿、主机/VM暂停或checkpoint/restore、墙钟跳变，不能仅靠同一run_id和墙钟日志区分。以下诊断只记录新观测，不回填历史报价、窗口成交或过去心跳。
+
+独立诊断任务默认每15秒记录 `heartbeat`，启动请求等待时也运行；主循环同时更新自身进度。诊断使用独立注入的系统时钟，不借用 `Strategy` 的决策时间：wall、monotonic、boottime、process_cpu（秒），以及 boot_id、PID、SID、原始 `/proc/self/stat` 的 `start_ticks`、`SC_CLK_TCK`、`/proc/stat` 的 btime。原始值不换算成ps启动日期；不可读取的字段为null并列出 `unavailable`，不读取任何进程environ。`workers` 为 main、diagnostics、discovery、resolution、valuation、stream 的内存进度：sequence、phase及四种时钟的最近进度时间。sequence表示阶段推进，不等于请求成功数。
+
+超过 `continuity_gap_seconds`（默认30秒）的心跳间隔、时钟倒退、wall/boottime相对monotonic偏差超过 `clock_tolerance_seconds`（默认2秒），或采样时原始身份变化，会写中性的 `continuity_gap`。事件包含前后完整样本、deltas、两个时钟差分、identity_changed、recovered_at和跨越的完整墙钟窗口数量/slug（列表最多100个，另标记截断）。这些窗口表示心跳间跨过的时间，不证明存在可交易信号；`cause` 始终为unknown。新run的首样本不与旧run比较，也不从DB恢复同进程连续性。
+
+`health.reliability` 显示最近心跳、当前worker进度、stream generation、cleanup_failed、owned_pending_tasks及慢操作统计；`stats` 的事件计数可查询 heartbeat/continuity_gap。owned_pending_tasks包括正常在途操作，不等同于失败数。
+
+| 可靠性参数 | 默认（秒） | 作用 |
+| --- | --- | --- |
+| diagnostic_heartbeat_seconds | 15 | 独立诊断心跳间隔 |
+| continuity_gap_seconds / clock_tolerance_seconds | 30 / 2 | 连续性缺口与时钟差分诊断阈值，不参与交易过滤 |
+| http_response_seconds | 15 | 一次完整HTTP响应预算，包括持续分块读取的body |
+| http_total_seconds | 60 | 最多4次请求及退避共享总预算，单次取剩余预算与响应预算较小值 |
+| ws_sync_seconds | 65 | 分别用于REST重同步、订阅成功后的WS初始双token快照同步；两段各有独立总预算 |
+| ws_send_seconds | 5 | 订阅消息及每次PING发送预算 |
+| cleanup_seconds | 3 | 每次取消后确认任务结束的等待预算，另计于操作预算 |
+| slow_operation_seconds | 0.1 | DB事务/汇总、日志emit/轮转和health写入的慢操作阈值 |
+| slow_diagnostic_throttle_seconds | 60 | 同类slow_operation诊断日志的最短间隔 |
+
+以上参数须为有限正数，仅影响可靠性和观测。原有HTTP阶段超时、重试类别/最多次数/指数退避、WS心跳与PONG阈值保持原值。HTTP 404不重试；慢速分块即使每次读取都未超过阶段超时，也不能无限延长完整响应预算。超时记录 `operation_deadline`；预算包含异步等待，不能抢占同步JSON解析/CPU或被阻塞的事件循环；解码后仍检查整体期限。库握手与关闭期限继续生效。离线测试通过HTTPX/httpcore的实际HTTP/1.1解析链注入缓慢chunked字节流，不用一次性假响应代替body读取；该测试不代表真实TCP网络验证。
+
+初始WS快照同步与周期PONG存活检查是独立条件。订阅发送成功后即启动固定monotonic期限；PONG、持续消息、单个token快照都不能续期，必须在期限内收到全部token的有效初始盘口。接收轮询及初始阶段PING发送取剩余同步预算，解析后也重新检查期限，超时不发布ready状态。失败先使盘口无效、确认旧接收任务清理并退出旧连接上下文，再按既有退避重连；拒绝取消时保持隔离，不建立替代订阅。
+
+HTTP/WS超时诊断使用实测monotonic `elapsed_seconds`，受监督操作还分列 `operation_elapsed_seconds`（请求取消前）和 `cleanup_elapsed_seconds`（取消确认）。`cleanup_incomplete` 也记录实际取消等待耗时。`health.reliability.operation_durations` 与 `cleanup_durations` 按固定操作名保存内存中的count、last/max秒数和最后结果；前者另含最近操作/清理拆分及timing_scope，成功操作不逐请求写日志。覆盖 http.complete_response、http.total、ws.rest_sync、ws.subscribe、ws.ping、ws.initial_sync及各取消清理标签；不记录每个普通recv的耗时，也不声称单独测量库内部握手/close。`http.total`包含全部尝试、退避及其清理，拆分字段为null（不把并发请求的清理时间混加），每次尝试的清理在http.complete_response及cleanup_durations下独立测量。初始快照同步成功的计时止于最后所需快照；失败时包括本阶段接收任务取消确认，排除前序REST/订阅和之后连接上下文关闭，其他阶段各自记录。
+
+这些预算是各阶段的异步工作期限，**不是整条连接生命周期统一的一次总预算**。在事件循环可运行、同步处理/诊断不阻塞的前提下，受监督调用的可观察返回时间还包含最多cleanup_seconds的取消确认及调度开销。HTTP整体重试预算计入此前清理，最后一次仍可能额外消耗取消确认宽限；初始WS同步若恰在PING发送中到期，可能先等待PING取消确认，再等待接收任务取消确认，之后还有库关闭流程。嵌套阶段的宽限不可笼统当成“一次3秒”。所有日志给出实际耗时，不能从配置预算反推真实阻塞时间；整机暂停或同步阻塞时，期限和取消确认均无法按时执行。
+
+取消使用 `asyncio.wait` 有界确认，而不把 `wait_for` 的取消请求误当作任务已经退出。若任务拒绝取消，会记录 `cleanup_incomplete` 与 `reliability_halted`，封住旧流代际、断开其本地盘口、阻止晚到回调和替代订阅；同窗口元数据更新也不能绕过隔离。进程不自动恢复交易。正常协作清理完成后才允许换流。关闭过程中若仍存在未完成任务，会保持运行锁和数据库，继续显示隔离状态，直到任务真实结束；重复取消关闭协程或隔离状态下health诊断写入失败，也不能提前释放锁。这可能导致退出等待无上限，**3秒仅是确认取消失败的预算，不是承诺强杀协程或完成进程退出**。同一Python进程无法安全强制结束非协作协程；不自动创建第二个实例来绕过隔离。清理不调用reset-circuit、不改变consecutive_losses或其他持久风险锁存。
+
+`slow_operation` 使用monotonic耗时，只对超过阈值的操作累计count/max/last，按操作名限频；全局诊断重入保护防止“慢日志又记录慢日志”的递归。慢操作日志不另写DB，以免诊断放大数据库阻塞；诊断sink异常不覆盖原操作异常。DB计时标签涵盖对应事务/账本操作，不声称可分离SQL、fsync与计算时间。所有同步阻塞只能在返回后记录，无法靠同线程超时抢占。
+
+**同主机/同事件循环的监测，在整台机器暂停期间不能运行或即时报警**；只能恢复后留下差分证据。宿主侧独立观测或平台暂停/恢复审计仍是区分VM暂停与进程卡顿的重要证据；本程序不配置外部监控、cron、routine、自动重启或新的交易熔断。
+
+```bash
+# 以下是操作者只读查看示例，不会重启服务或迁移账本
+uv run --locked btc5m health
+uv run --locked btc5m stats --since 2026-11-07T10:00:00-08:00 --run-id '替换为实际UUID'
+```
 
 ## 紧急停止和恢复
 

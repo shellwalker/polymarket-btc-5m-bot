@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from btc5m.config import Settings
 from btc5m.domain import ONE, ZERO, Book, Market, Signal, array, fee, number
+from btc5m.reliability import SlowOperations
 from btc5m.schema import SUPPORTED_VERSIONS, migrate
 from btc5m.telemetry import current_run_id, equity_snapshot, quote_snapshot
 
@@ -26,9 +27,19 @@ TRANSIENT_BREAKERS = frozenset({"abnormal_spread", "stale_or_disconnected_book"}
 
 
 class Ledger:
-    def __init__(self, path: Path, settings: Settings, *, run_id: str | None = None):
+    def __init__(
+        self,
+        path: Path,
+        settings: Settings,
+        *,
+        run_id: str | None = None,
+        slow: SlowOperations | None = None,
+    ):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.settings = settings
+        self.slow = slow or SlowOperations(
+            settings.slow_operation_seconds, settings.slow_diagnostic_throttle_seconds
+        )
         self.run_id = run_id or current_run_id()
         self.clear_recovery_progress()
         self.db = sqlite3.connect(path, timeout=5)
@@ -69,7 +80,7 @@ class Ledger:
         )
 
     def event(self, kind: str, payload: dict[str, Any], now: float) -> None:
-        with self.db:
+        with self.slow.measure("db.event_commit"), self.db:
             self._event(kind, payload, now)
 
     def _active_interval(self) -> sqlite3.Row | None:
@@ -289,7 +300,7 @@ class Ledger:
         return json.loads(row[0]) if row else None
 
     def record_equity(self, books: dict[str, Book], now: float) -> dict[str, Any]:
-        with self.db:
+        with self.slow.measure("db.equity_commit"), self.db:
             previous = self.latest_equity()
             result = equity_snapshot(
                 number(self._meta("cash")),
@@ -345,7 +356,8 @@ class Ledger:
         self.event("order_attempt", context, order_at)
         circuit = self._meta("circuit")
         try:
-            result = self._execute(market, book, signal, now, context)
+            with self.slow.measure("db.execute_transaction"):
+                result = self._execute(market, book, signal, now, context)
         except BaseException as exc:
             # _execute has rolled back trading mutations. Each rejected attempt is
             # audited even if Service deduplicates its human-readable rejection log.
@@ -504,6 +516,12 @@ class Ledger:
         return result
 
     def settle(self, market: Market, official: dict[str, Any], now: float) -> dict[str, Any] | None:
+        with self.slow.measure("db.settlement_transaction"):
+            return self._settle(market, official, now)
+
+    def _settle(
+        self, market: Market, official: dict[str, Any], now: float
+    ) -> dict[str, Any] | None:
         """Accept a terminal official Gamma market only; never infer from spot or clock."""
         if now < market.end or official.get("conditionId") != market.condition:
             return None
@@ -608,7 +626,8 @@ class Ledger:
             raise
 
     def summary(self) -> dict[str, Any]:
-        return self._summary(self.db)
+        with self.slow.measure("db.summary"):
+            return self._summary(self.db)
 
     @classmethod
     def read_summary(cls, path: Path) -> dict[str, Any]:

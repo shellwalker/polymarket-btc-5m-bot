@@ -41,3 +41,24 @@ def test_live_in_file_cannot_be_hidden_by_environment(tmp_path):
 def test_invalid_observability_settings(key, value):
     with pytest.raises(ValueError):
         Settings.load(environ={"BTC5M_" + key.upper(): value})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "diagnostic_heartbeat_seconds",
+        "continuity_gap_seconds",
+        "clock_tolerance_seconds",
+        "http_response_seconds",
+        "http_total_seconds",
+        "ws_sync_seconds",
+        "ws_send_seconds",
+        "cleanup_seconds",
+        "slow_operation_seconds",
+        "slow_diagnostic_throttle_seconds",
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "true"])
+def test_reliability_budgets_must_be_positive_finite(key, value):
+    with pytest.raises(ValueError):
+        Settings.load(environ={"BTC5M_" + key.upper(): value})

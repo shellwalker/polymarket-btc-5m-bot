@@ -19,6 +19,7 @@ import httpx
 from .config import Settings
 from .ledger import Ledger
 from .public import PublicAPI
+from .reliability import SlowOperations
 from .service import RuntimeLock, Service, read_status
 from .stats import read_stats, timestamp
 from .telemetry import current_run_id
@@ -41,10 +42,22 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(result, ensure_ascii=False, default=str)
 
 
-def configure_logs(directory: Path) -> None:
+class MeasuredFileHandler(RotatingFileHandler):
+    def __init__(self, filename: Path, settings: Settings):
+        super().__init__(filename, maxBytes=5_000_000, backupCount=5)
+        self.slow = SlowOperations(
+            settings.slow_operation_seconds, settings.slow_diagnostic_throttle_seconds
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        with self.slow.measure("log.emit"):
+            super().emit(record)
+
+
+def configure_logs(directory: Path, settings: Settings | None = None) -> None:
     logs = directory / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(logs / "paper.jsonl", maxBytes=5_000_000, backupCount=5)
+    handler = MeasuredFileHandler(logs / "paper.jsonl", settings or Settings())
     handler.setFormatter(JsonFormatter())
     logger = logging.getLogger("btc5m")
     logger.setLevel(logging.INFO)
@@ -117,7 +130,7 @@ def main() -> None:
                 finally:
                     ledger.close()
         elif args.command == "run":
-            configure_logs(directory)
+            configure_logs(directory, settings)
             asyncio.run(run(settings))
         else:
             if read_status(directory)["running"]:
