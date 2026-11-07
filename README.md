@@ -74,7 +74,7 @@ min_time_remaining = 30
 
 ## 运行、状态、日志和损益
 
-支持前台运行和独立后台进程，不依赖 cron/systemd。以下命令使用默认 `runtime`；如使用自定义配置，所有命令统一写为 `uv run --locked btc5m --config /absolute/path/paper.toml <子命令>`，文件路径也改为该配置的 `runtime_dir`。
+支持前台运行和独立后台进程，不依赖 cron/systemd。`btc5m start` 使用 `subprocess.Popen(..., start_new_session=True)`，通过 `setsid` 建立独立会话，脱离终端运行，无需额外使用 cron 或 nohup。以下命令使用默认 `runtime`；如使用自定义配置，所有命令统一写为 `uv run --locked btc5m --config /absolute/path/paper.toml <子命令>`，文件路径也改为该配置的 `runtime_dir`。
 
 ```bash
 # 前台，Ctrl-C/SIGTERM 干净退出
@@ -111,7 +111,7 @@ STOP 文件和命令不会根据陈旧 pidfile 杀进程。信号/文件在启�
 
 日亏损、连续亏损、市场身份变化及未知原因始终只允许人工恢复；发生时会优先覆盖已有行情熔断，防止被自动恢复误清除。自动恢复不重置连续亏损计数、日亏损、现金、持仓或成交额度。风控预算拒绝本身不消耗成交额度。
 
-**Box 重启后不会自动启动服务**；后台进程也不会跨机器重启存活。本项目不配置 cron、routine 或开机自启。以下是操作者手动恢复/启动步骤（本文命令未由本次修复执行）：
+**Box 重启后不会自动启动服务**；后台进程也不会跨机器重启存活。本项目不配置 cron、routine 或开机自启。以下是操作者手动恢复/启动步骤：
 
 ```bash
 cd /workspace/repos/polymarket-btc-5m-bot
