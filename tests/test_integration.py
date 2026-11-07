@@ -15,7 +15,8 @@ from btc5m.service import Service
 
 
 @pytest.mark.asyncio
-async def test_mock_rest_ws_reconnect_settlement_and_restart(tmp_path):
+@pytest.mark.parametrize("auto_recovery", [False, True])
+async def test_mock_rest_ws_reconnect_settlement_and_restart(tmp_path, auto_recovery):
     from test_domain import event
 
     now = [1800000001.0]
@@ -83,6 +84,7 @@ async def test_mock_rest_ws_reconnect_settlement_and_restart(tmp_path):
         async def recv(self):
             await asyncio.sleep(0.01)
             self.n += 1
+            now[0] += 0.01
             if self.n == 1:
                 return json.dumps([snap(t) for t in self.tokens])
             if self.n == 2:
@@ -105,6 +107,9 @@ async def test_mock_rest_ws_reconnect_settlement_and_restart(tmp_path):
 
     settings = Settings(
         runtime_dir=tmp_path,
+        market_auto_recovery=auto_recovery,
+        market_recovery_snapshots=2,
+        market_recovery_cooldown=0.001,
         discovery_seconds=0.01,
         resolution_seconds=0.01,
         retry_initial=0.001,
@@ -116,9 +121,12 @@ async def test_mock_rest_ws_reconnect_settlement_and_restart(tmp_path):
         service = Service(settings, api, connect=lambda *a, **k: Context(), clock=lambda: now[0])
         await asyncio.wait_for(service.run(stop), 3)
     first = Ledger.read_summary(tmp_path / "ledger.sqlite3")
-    # First disconnect is a persistent circuit; second window is intentionally blocked.
-    assert first["fills"] == 1 and first["settlements"] == 1 and first["pending"] == 0
-    assert first["circuit"] == "stale_or_disconnected_book"
+    assert first["fills"] == (2 if auto_recovery else 1)
+    assert first["settlements"] == 1
+    assert first["pending"] == (1 if auto_recovery else 0)
+    assert first["circuit"] == ("" if auto_recovery else "stale_or_disconnected_book")
+    if auto_recovery:
+        assert first["event_counts"]["circuit_reset"] >= 1
     assert len(connections) >= 3
     assert rest_snapshots.count("u") >= 2
     # Restart against same DB with STOP requires no network and preserves all counters.

@@ -125,6 +125,7 @@ class Service:
             b.healthy(now, self.settings.stale_seconds) for b in self.books.values()
         )
         if not healthy:
+            self.ledger.observe_market_health(False, None, now)
             if self.ever_ready and now < self.market.end:
                 self.ledger.trip("stale_or_disconnected_book", now)
             return
@@ -135,11 +136,17 @@ class Service:
             and b.best_ask - b.best_bid > self.settings.max_spread
             for b in self.books.values()
         ):
+            self.ledger.observe_market_health(False, None, now)
             self.ledger.trip("abnormal_spread", now)
             return
+        observation = (
+            self.market.slug,
+            *((token, book.source_time) for token, book in sorted(self.books.items())),
+        )
+        self.ledger.observe_market_health(True, observation, now)
         if (self.settings.runtime_dir / "STOP").exists():
             return
-        if self.ledger.has_order(self.market.slug):
+        if self.ledger.window_entry_limit_reached(self.market.slug):
             return
         signal = self.strategy.signal(self.market, self.books, now)
         if signal is None:
@@ -201,6 +208,8 @@ class Service:
                 self.prior_reconnects += self.stream.reconnects
             self.market, self.books, self.stream = market, {}, None
             self.ever_ready = False
+            if self.ledger is not None:
+                self.ledger.clear_recovery_progress()
             self.last_rejection = ""
             if market is None:
                 return
@@ -221,7 +230,7 @@ class Service:
     def risk_blocked_reasons(self, now: float) -> list[str]:
         if self.ledger is None or self.market is None:
             return ["no active market or ledger"]
-        if self.ledger.has_order(self.market.slug):
+        if self.ledger.window_entry_limit_reached(self.market.slug):
             return ["window already filled"]
         candidates = []
         for book in self.books.values():

@@ -31,6 +31,10 @@ max_trade = "10"
 max_exposure = "50"
 daily_loss_limit = "20"
 max_consecutive_losses = 3
+max_entries_per_window = 1
+market_auto_recovery = true
+market_recovery_snapshots = 3
+market_recovery_cooldown = 30
 shares = "5"
 paper_fee_multiplier = "1"
 signal_threshold = "0.03"
@@ -48,6 +52,10 @@ min_time_remaining = 30
 | max_trade | 10 | 单笔成本加费用上限 |
 | max_exposure | 50 | 所有待结算持仓成本加费用上限 |
 | daily_loss_limit | 20 | UTC 当日已实现亏损总额 + 全部待结算最坏损失 + 新单最坏损失上限；盈利不抵消亏损 |
+| max_entries_per_window | 1 | 每窗口成功成交上限，正整数；Up/Down共享，跨重启、结算持久计数；拒绝与事务回滚不占次数 |
+| market_auto_recovery | true | 仅允许两种行情熔断自动恢复；false 保留人工恢复模式 |
+| market_recovery_snapshots | 3 | 恢复所需连续健康盘口观测次数，正整数；完整双token同步且至少一个服务端时间戳推进才计一次 |
+| market_recovery_cooldown | 30 秒 | 从首次健康观测开始的连续健康冷却时间，必须为正；次数和时间须同时满足，并由新的健康观测完成恢复 |
 | max_consecutive_losses | 3 | 连续已结算亏损触发持久熔断 |
 | paper_fee_multiplier | 1 | 纯模拟费用保守倍数，有限 Decimal 且必须 >=1；模拟系数为已核实0.07乘此值，不改变官方schema校验 |
 | shares | 5 | 每次信号目标份数；必须满足该市场最小数量 |
@@ -62,11 +70,11 @@ min_time_remaining = 30
 | retry_initial / retry_max | 1 / 30 秒 | 指数退避；WS 稳定 30 秒后恢复初始退避 |
 | heartbeat_seconds / pong_timeout | 10 / 20 秒 | 文本 PING/PONG；行情流量不能代替 PONG |
 
-策略接口是 `Strategy.signal()`。自带基线记录**本次进程在窗口内首次健康的 Up midpoint**，变动向上买 Up、向下买 Down；必须满足幅度、价差、价格、费用及滑点过滤。窗口中途启动不会假装知道开盘价格；重启重新建立观测锚点。无信号就不成交。每窗口最多一笔持久化成交，绝不为了展示结果强制交易。未成交时，同一窗口/方向的信号与尝试最多每30秒一次，防止持续风控拒绝淹没日志；新方向可独立评估，成功成交后仍由账本去重。
+策略接口是 `Strategy.signal()`。自带基线记录**本次进程在窗口内首次健康的 Up midpoint**，变动向上买 Up、向下买 Down；必须满足幅度、价差、价格、费用及滑点过滤。窗口中途启动不会假装知道开盘价格；重启重新建立观测锚点。无信号就不成交。每窗口最多 `max_entries_per_window` 笔持久化成交（默认1），绝不为了展示结果强制交易。未成交时，同一窗口/方向的信号与尝试最多每30秒一次，防止持续风控拒绝淹没日志；新方向可独立评估，达到成功成交额度后由服务层及账本事务双重拦截；提高额度不会放宽现金、敞口或亏损限制。
 
 ## 运行、状态、日志和损益
 
-支持前台运行和独立后台进程，不依赖 cron/systemd。
+支持前台运行和独立后台进程，不依赖 cron/systemd。以下命令使用默认 `runtime`；如使用自定义配置，所有命令统一写为 `uv run --locked btc5m --config /absolute/path/paper.toml <子命令>`，文件路径也改为该配置的 `runtime_dir`。
 
 ```bash
 # 前台，Ctrl-C/SIGTERM 干净退出
@@ -97,22 +105,49 @@ touch runtime/STOP
 # 或对已确认的服务进程发送 SIGTERM / 前台 Ctrl-C
 ```
 
-STOP 文件和命令不会根据陈旧 pidfile 杀进程。信号/文件在启动网络阻塞时也能退出；停止后取消 WS、落盘状态、关闭数据库并释放锁。停止不伪造结算，也不删除未解决持仓。进程下次运行从数据库继续追踪官方结果；已成交窗口和已结算窗口均不会重复入账。
+STOP 文件和命令不会根据陈旧 pidfile 杀进程。信号/文件在启动网络阻塞时也能退出；停止后取消 WS、落盘状态、关闭数据库并释放锁。停止不伪造结算，也不删除未解决持仓。进程下次运行从数据库继续追踪官方结果；已成交和已结算记录均不重复入账，窗口额度不会因结算或重启恢复。
 
-行情过期/断线（首次成功同步之后）、异常价差、日亏损和连续亏损熔断持久化；重启不会解除。排查后，必须在服务停止时显式恢复：
+行情过期/断线（首次成功同步之后）与异常价差仍持久化，但默认允许在行情恢复后自动解除：只有当前窗口全部token已同步、新鲜且价差正常，连续健康观测次数和冷却时间同时达标，才写入 `circuit_reset`（`automatic=true`、原原因、健康次数和秒数）。周期轮询、同一盘口时间戳、成交消息不增加次数；任一不健康观测、窗口切换或重启均清空恢复进度，重启本身不会解除熔断，跨窗口也要重新证明健康。可设置 `market_auto_recovery=false` 禁用。
+
+日亏损、连续亏损、市场身份变化及未知原因始终只允许人工恢复；发生时会优先覆盖已有行情熔断，防止被自动恢复误清除。自动恢复不重置连续亏损计数、日亏损、现金、持仓或成交额度。风控预算拒绝本身不消耗成交额度。
+
+**Box 重启后不会自动启动服务**；后台进程也不会跨机器重启存活。本项目不配置 cron、routine 或开机自启。以下是操作者手动恢复/启动步骤（本文命令未由本次修复执行）：
+
+```bash
+cd /workspace/repos/polymarket-btc-5m-bot
+uv run --locked btc5m status
+uv run --locked btc5m summary
+# 若仍在运行，先停止，再重复 status，直到 running=false：
+uv run --locked btc5m stop
+uv run --locked btc5m status
+```
+
+检查故障和风险后，仅在服务已停止且确需人工清除熔断时执行（行情自动恢复无需本步骤）：
 
 ```bash
 uv run --locked btc5m reset-circuit
-# 确认风险后手工删除急停文件（如存在）
-rm -f runtime/STOP
-uv run --locked btc5m start
 ```
 
-`reset-circuit` 有审计事件并重置亏损连续计数；不改变现金、日亏损、未结算敞口和订单去重。日亏损风控仍然有效。不要删 DB 来“修复”风控；应停机备份整个运行目录。SQLite 表格式升级目前需人工迁移，未知版本拒绝启动。
+确认可以恢复paper运行后，手工清除STOP并显式后台启动；无需清除熔断时直接从这里继续：
+
+```bash
+rm -f runtime/STOP
+uv run --locked btc5m start
+uv run --locked btc5m status
+uv run --locked btc5m health
+# 查看后台启动错误及paper日志
+tail -n 50 runtime/launcher.log
+tail -n 50 runtime/logs/paper.jsonl
+# 停止后台进程，再确认已经退出
+uv run --locked btc5m stop
+uv run --locked btc5m status
+```
+
+`reset-circuit` 有审计事件并重置亏损连续计数；不改变现金、日亏损、未结算敞口和订单去重。日亏损风控仍然有效。不要删 DB 来“修复”风控；应停机备份整个运行目录。本次保留 schema_version=1 和既有 orders/fills/settlements 记录，启动时幂等增加 `order_windows` 映射并将旧订单计入原窗口额度；额外成交使用独立订单ID（窗口slug加序号），每笔单独结算，`pending`按未结算订单计数。旧记录的金额和审计事件不重写；未知版本拒绝启动。
 
 ## 撮合、结算和限制
 
-- 仅模拟买入 taker，按 ask 从低到高逐档成交。每档遵守 tick/滑点/限价，整单数量不足则拒绝；扣减深度与持久窗口去重共同避免重复使用。不是 maker 队列或部分成交模拟。
+- 仅模拟买入 taker，按 ask 从低到高逐档成交。每档遵守 tick/滑点/限价，整单数量不足则拒绝；扣减深度与持久窗口额度共同限制重复使用（提高额度允许后续新快照提供新显示深度）。不是 maker 队列或部分成交模拟。
 - 每个价格档默认手续费 `C × 0.07 × p × (1-p)`；可设置 `paper_fee_multiplier`（例如2）做保守压力测试，策略费用过滤和每档撮合统一使用 `0.07 × paper_fee_multiplier`，四舍五入至 5 位小数后求和；此逐档聚合及 HALF_UP 是明确的模拟假设，不模拟返佣、链上费用和真实 match 拆分。health、启动日志/事件和成交审计事件记录 `verified_fee_rate`、`paper_fee_multiplier`、`paper_fee_rate`；倍数只是paper假设，绝非实时费率声明。重启修改倍数只影响后续信号/新成交，不追改既有费用。
 - 每次发现验证该市场 `crypto_fees_v2` / exponent=1 / rate=0.07 / takerOnly=true。仅支持已观察的 v1 token schema、BTC 60s TWAP 规则配置；v2/未知费用和规则均停止新交易。
 - 重连时全盘口失效，先做 REST 重同步，再订阅并等待每个 token 的 WS 初始快照建立独立有序基线，避免把已排队的旧增量混入较新的 REST 盘口。完整 price_change 跨 token 原子应用，官方 best_bid/best_ask 边界只删除矛盾旧档位，不创造缺失深度；结果仍交叉或最优价缺档则重同步。后续旧时间戳不覆盖新数据。没有 WS 序号可做绝对缺口证明，同毫秒事件按接收顺序处理；异常时断开并 resync。

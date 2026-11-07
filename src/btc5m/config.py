@@ -31,6 +31,10 @@ class Settings:
     max_exposure: Decimal = Decimal("50")
     daily_loss_limit: Decimal = Decimal("20")
     max_consecutive_losses: int = 3
+    max_entries_per_window: int = 1
+    market_auto_recovery: bool = True
+    market_recovery_snapshots: int = 3
+    market_recovery_cooldown: float = 30.0
     stale_seconds: float = 5.0
     max_spread: Decimal = Decimal("0.05")
     max_slippage: Decimal = Decimal("0.02")
@@ -59,6 +63,9 @@ class Settings:
             elif isinstance(value, (float, int)) and not isinstance(value, bool):
                 if not math.isfinite(value) or value <= 0:
                     raise ValueError(f"{field.name} must be finite and positive")
+        for name in ("max_entries_per_window", "market_recovery_snapshots"):
+            if type(getattr(self, name)) is not int:
+                raise ValueError(f"{name} must be an integer")
         if self.paper_fee_multiplier < 1:
             raise ValueError("paper_fee_multiplier must be >= 1 (conservative paper assumption)")
         if self.max_spread >= 1 or self.max_slippage >= 1 or self.max_entry_price >= 1:
