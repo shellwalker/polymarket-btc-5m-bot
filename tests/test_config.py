@@ -34,3 +34,10 @@ def test_live_in_file_cannot_be_hidden_by_environment(tmp_path):
     config.write_text("live=true\n")
     with pytest.raises(ValueError, match="paper"):
         Settings.load(config, {"BTC5M_LIVE": "false"})
+
+
+@pytest.mark.parametrize("key", ["equity_snapshot_seconds", "valuation_stale_seconds"])
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "true"])
+def test_invalid_observability_settings(key, value):
+    with pytest.raises(ValueError):
+        Settings.load(environ={"BTC5M_" + key.upper(): value})

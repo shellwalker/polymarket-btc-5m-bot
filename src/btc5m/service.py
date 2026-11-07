@@ -13,11 +13,13 @@ from contextlib import AbstractContextManager
 from dataclasses import replace
 from pathlib import Path
 from typing import IO, Any
+from uuid import uuid4
 
 from .config import Settings
-from .domain import ZERO, Book, Market, MomentumStrategy, fee
+from .domain import ZERO, Book, Market, MomentumStrategy, fee, number
 from .ledger import Ledger, Rejected
 from .public import MarketStream
+from .telemetry import RUN_ID, current_run_id, quote_snapshot
 
 LOG = logging.getLogger(__name__)
 
@@ -88,8 +90,12 @@ class Service:
         *,
         clock: Callable[[], float] = time.time,
         connect: Any = None,
+        run_id: str | None = None,
     ) -> None:
         self.settings, self.api, self.clock = settings, api, clock
+        self.run_id = run_id or current_run_id()
+        self.valuation_books: dict[str, Book] = {}
+        self.next_equity_at = float("-inf")
         self.connect = connect
         self.market: Market | None = None
         self.known_market: Market | None = None
@@ -109,6 +115,7 @@ class Service:
         self.geo: dict[str, Any] = {}
 
     def record(self, kind: str, details: dict[str, Any]) -> None:
+        details = {**details, "run_id": self.run_id}
         LOG.info(kind, extra={"details": details})
         if self.ledger is not None:
             self.ledger.event(kind, details, self.clock())
@@ -155,6 +162,10 @@ class Service:
         if now - self.signal_last.get(decision, float("-inf")) < 30:
             return
         self.signal_last[decision] = now
+        signal_id = str(uuid4())
+        signal_quote = quote_snapshot(
+            self.books[self.market.tokens[signal.outcome]], now, self.settings.stale_seconds
+        )
         self.record(
             "signal",
             {
@@ -163,18 +174,40 @@ class Service:
                 "quantity": str(signal.quantity),
                 "limit": str(signal.limit_price),
                 "reason": signal.reason,
+                "signal_id": signal_id,
+                "attempt_id": None,
+                "order_id": None,
+                "signal_at": now,
+                "signal_quote": signal_quote,
+                "order_at": None,
+                "order_quote": None,
+                "fill_ladder": None,
+                "execution_slippage": None,
+                "signal_to_order_move": None,
             },
         )
         try:
             fill = self.ledger.execute(
-                self.market, self.books[self.market.tokens[signal.outcome]], signal, now
+                self.market,
+                self.books[self.market.tokens[signal.outcome]],
+                signal,
+                now,
+                audit={
+                    "signal_id": signal_id,
+                    "signal_at": now,
+                    "signal_quote": signal_quote,
+                    "order_at": self.clock(),
+                },
             )
             if fill is not None:
                 LOG.info("paper_fill", extra={"details": fill})
         except Rejected as exc:
             reason = str(exc)
             if self.last_rejection != reason:
-                self.record("order_rejected", {"slug": self.market.slug, "reason": reason})
+                self.record(
+                    "order_rejected",
+                    {"slug": self.market.slug, "reason": reason, "signal_id": signal_id},
+                )
                 self.last_rejection = reason
 
     async def switch(self, market: Market | None) -> None:
@@ -268,10 +301,17 @@ class Service:
         )
         summary = self.ledger.summary() if self.ledger is not None else {}
         risk_blocked = self.risk_blocked_reasons(now)
+        equity = self.ledger.latest_equity() if self.ledger else None
         atomic_json(
             self.settings.runtime_dir / "health.json",
             {
                 "updated": now,
+                "run_id": self.run_id,
+                "equity_snapshot": equity,
+                "equity_snapshot_age_seconds": now - equity["created"] if equity else None,
+                "equity_snapshot_overdue": bool(
+                    equity and now - equity["created"] > self.settings.equity_snapshot_seconds
+                ),
                 "pid": os.getpid(),
                 "mode": "paper",
                 "stopped": stopped,
@@ -299,6 +339,63 @@ class Service:
                 "summary": summary,
             },
         )
+
+    def snapshot_equity_if_due(self) -> None:
+        if self.ledger is None:
+            return
+        now = self.clock()
+        if now < self.next_equity_at:
+            return
+        try:
+            snapshot = self.ledger.record_equity(self.valuation_books, now)
+            LOG.info("equity_snapshot", extra={"details": snapshot})
+        except Exception:
+            # Observability failure must not become a trading gate or a breaker.
+            LOG.exception("equity_snapshot_error", extra={"details": {"run_id": self.run_id}})
+        self.next_equity_at = now + self.settings.equity_snapshot_seconds
+
+    async def refresh_valuation_quotes(self) -> None:
+        """Independent validated CLOB-only books for all pending windows; never traded."""
+        if self.ledger is None:
+            return
+        tokens = {p["token"]: p["tick"] for p in self.ledger.pending_positions()}
+        self.valuation_books = {t: b for t, b in self.valuation_books.items() if t in tokens}
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch(token: str, tick: str) -> None:
+            async with semaphore:
+                try:
+                    raw = await self.api.snapshot(token)
+                    book = Book(token, number(tick))
+                    # Use the public snapshot's tick when present, otherwise the verified
+                    # persisted market tick. No mutation of Service.books or stream state.
+                    book.change_tick(raw.get("tick_size", tick))
+                    book.snapshot(raw, self.clock())
+                    self.valuation_books[token] = book
+                except Exception as exc:
+                    self.valuation_books.pop(token, None)
+                    LOG.warning(
+                        "valuation_quote_unavailable",
+                        extra={
+                            "details": {"run_id": self.run_id, "token": token, "error": str(exc)}
+                        },
+                    )
+
+        await asyncio.gather(*(fetch(token, tick) for token, tick in tokens.items()))
+
+    async def periodic_valuation_quotes(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await self.refresh_valuation_quotes()
+            except Exception:
+                LOG.exception("valuation_refresh_error", extra={"details": {"run_id": self.run_id}})
+            await self.pause(
+                stop,
+                min(
+                    self.settings.equity_snapshot_seconds / 2,
+                    self.settings.valuation_stale_seconds / 2,
+                ),
+            )
 
     async def resolve_pending(self) -> None:
         assert self.ledger is not None
@@ -352,10 +449,19 @@ class Service:
             await self.pause(stop, 0.1)
 
     async def run(self, stop: asyncio.Event) -> None:
+        token = RUN_ID.set(self.run_id)
+        try:
+            await self._run(stop)
+        finally:
+            RUN_ID.reset(token)
+
+    async def _run(self, stop: asyncio.Event) -> None:
         self.stop = stop
         settings = self.settings
         with RuntimeLock(settings.runtime_dir):
-            self.ledger = Ledger(settings.runtime_dir / "ledger.sqlite3", settings)
+            self.ledger = Ledger(
+                settings.runtime_dir / "ledger.sqlite3", settings, run_id=self.run_id
+            )
             tasks: list[asyncio.Task[None]] = []
             try:
                 if (settings.runtime_dir / "STOP").exists() or stop.is_set():
@@ -383,6 +489,7 @@ class Service:
                 tasks = [
                     asyncio.create_task(self.periodic_discovery(stop)),
                     asyncio.create_task(self.periodic_resolution(stop)),
+                    asyncio.create_task(self.periodic_valuation_quotes(stop)),
                 ]
                 self.record("service_started", {"mode": "paper", **settings.fee_assumption()})
                 while not stop.is_set():
@@ -394,6 +501,7 @@ class Service:
                     if self.market is not None and self.clock() >= self.market.end:
                         await self.switch(None)
                     self.update()
+                    self.snapshot_equity_if_due()
                     self.health()
                     for task in tasks:
                         if task.done():

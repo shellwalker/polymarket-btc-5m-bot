@@ -26,6 +26,8 @@ uv run --locked pytest -q
 ```toml
 live = false
 runtime_dir = "runtime"
+equity_snapshot_seconds = 15
+valuation_stale_seconds = 5
 initial_cash = "1000"
 max_trade = "10"
 max_exposure = "50"
@@ -48,6 +50,8 @@ min_time_remaining = 30
 
 | 参数 | 默认 | 含义 |
 | --- | --- | --- |
+| equity_snapshot_seconds | 15 秒 | 仅观测：持久权益快照间隔，有限正数，不改变交易决策 |
+| valuation_stale_seconds | 5 秒 | 仅观测：独立估值盘口的服务端/本地双重新鲜度限额，有限正数，不影响交易盘口或熔断 |
 | initial_cash | 1000 | 首次建账模拟现金；重启和修改配置不会重置旧账 |
 | max_trade | 10 | 单笔成本加费用上限 |
 | max_exposure | 50 | 所有待结算持仓成本加费用上限 |
@@ -94,7 +98,39 @@ tail -f runtime/logs/paper.jsonl
 
 运行目录固定包含 `ledger.sqlite3`（WAL/FULL 同步）、`process.lock`、`pid.json`、`health.json`、`STOP` 和日志。`paper.jsonl` 单文件 5 MB、保留 5 个备份；`launcher.log` 记录后台启动错误。SQLite 是审计事实来源；`events` 包含 signal、拒绝、成交、结算、熔断及状态事件，`orders/fills/settlements/daily/meta` 保存账本。行情原始帧不全量保存，DB 不自动删除审计记录。
 
-`summary` 使用只读、一致 SQLite 快照。`cash` 为剩余模拟现金；`realized_pnl` 为已结算损益，`total_fees` 为总手续费；`exposure` 含待结算成本和费用，`pending` 为待结算市场数；`equity_at_cost` 为现金加待结算本金（不含已付费用，**不是市值或收益预测**），`equity_worst_case` 把全部待结算价值记零。提供成交/逐档/结算计数、UTC 日亏损、连续亏损及熔断原因。
+`summary` 使用只读、一致 SQLite 快照。`cash` 为剩余模拟现金；`realized_pnl` 为已结算损益，`total_fees` 为总手续费；`exposure` 含待结算成本和费用，`pending` 为待结算订单数；`equity_at_cost` 为现金加待结算本金（不含已付费用，**不是市值或收益预测**），`equity_worst_case` 把全部待结算价值记零。提供成交/逐档/结算计数、UTC 日亏损、连续亏损及熔断原因。
+
+## 观测审计与只读统计
+
+每个进程生成独立 UUID `run_id`。新 `events` 行的列和 JSON payload 均附带此值，结构化日志顶层和 `details` 也包含它，包括 HTTP 重试、发现错误、WS 重连/恢复及启动/退出。`health` 显示当前 `run_id`；旧事件的列为 `NULL`，原 JSON 不改写，也不归属于新进程。`run_id` 由程序生成，无需配置。
+
+`signal` 保存信号时刻的 `signal_quote`：best bid/ask/mid、CLOB `source_at`、本地盘口接收应用时间 `received_at`、两种 age（秒）、健康状态和观测时刻，价格为精确 Decimal 字符串。未来的 `order_at/order_quote/order_id/attempt_id/fill_ladder/execution_slippage/signal_to_order_move` 明确为 `null`。后续 `order_attempt`、`order_result` 和 `paper_fill` 通过 `signal_id` 关联；每次实际订单尝试另有 `attempt_id`。订单尝试保存独立的订单时刻盘口，即使拒绝，也保留此快照和独立结果事件；原 `order_rejected` 人类可读日志的去重保持不变。只有成交才有非空 `order_id` 和逐档 `fill_ladder`（price/quantity/fee）。`paper_fill` 与资金/成交在同一事务内提交；进程若在尝试与结果之间崩溃，可能留下无结果的 `order_attempt`，不会回填成虚构成功/拒绝。直接调用账本而无上游信号时，信号信息为 `null`，不伪造信号。
+
+`paper_fill` 的 `execution_slippage = average_price - order_quote.best_ask`，`signal_to_order_move = order_quote.best_ask - signal_quote.best_ask`，均为绝对价格单位，分开记录，不能混为同一种滑点。费用单列，不包含在这两个价格差中。`signal_at` 是既有决策时间，`order_at` 是调用模拟执行时的本地观测时间，`decision_at` 保留原决策检查时间；新增观测不会改变原时间窗口、风控、费用或滑点检查。它们不代表真实交易所的下单或成交时间。
+
+权益默认每15秒写入 `equity_snapshots`，记录 cash、每笔未结算持仓、bid/mid 市值、两种 equity 及回撤；`health.equity_snapshot` 显示最近已记录快照和累计回撤，`equity_snapshot_age_seconds/overdue` 提示快照年龄/是否超过配置间隔。该值是带时间戳的历史观测，不承诺当前可平仓金额。估值工作在独立后台任务中，只对账本里所有未结算 token（包括旧窗口）读取公开 CLOB `/book`，按身份、tick、深度及服务端/本地时间验证；最多4个并发，每轮后等待 `min(equity_snapshot_seconds/2, valuation_stale_seconds/2)`。网络延迟可能使刷新变慢，决策和快照计时不等待估值请求。估值不读取 Gamma 价格，不更新策略盘口、不消耗其深度、不触发新行情熔断，也不参与任何交易过滤。
+
+市值定义为份数乘显示 best bid 或 `(bid+ask)/2`，不扣假设平仓费用，不假设顶档深度可覆盖全部持仓。无持仓时 equity=cash；任一持仓缺报价、过期、断线、交叉或其他无效时，对应持仓市值及**组合总市值/equity 为 `null`，`complete=false`**，并列出每笔 `mark_status`。可用持仓仍显示各自市值，但不把不完整小计伪装成总值；不以成本、零或 Gamma 陈旧价格替代。结算仍只依赖原有官方证据路径。
+
+回撤只基于启用观测之后的完整持久快照：分别记录 bid/mid 历史峰值、当前回撤、最大回撤（金额和 fraction 比例，0.1 表示10%）。首次完整快照是峰值起点，不把初始现金当作未观察到的历史权益。峰值/最大回撤跨重启延续；不完整快照当前回撤为 `null`，只保留此前已测峰值/最大值。缺失期间和两次快照之间的低点无法证明，采样回撤可能低估真实路径；不重新计算历史持仓价格或回填旧快照。
+
+```bash
+# 全部已记录观测，只读，不连接网络、不持锁启动服务、不迁移数据库
+uv run --locked btc5m stats
+# 左闭右开 [since, until)，ISO必须有Z或显式时区；也接受Unix epoch秒
+uv run --locked btc5m stats --since 2026-11-07T10:00:00-08:00 --until 2026-11-07T11:00:00-08:00
+uv run --locked btc5m stats --since 1799999999 --until 1800000300 --run-id '替换为实际UUID'
+# 只查看没有进程归属的旧事件
+uv run --locked btc5m stats --run-id legacy
+```
+
+`stats` 输出选定范围/进程的事件计数、run分组、成交滑点样本均值、快照数/完整数、最近快照和 `selected_drawdown`。该回撤只使用选定完整样本；`latest_equity.drawdown` 则是该快照记录时的全局累计值，可能包含范围外峰值，两者含义不同。无可用完整样本时回撤为 `null`。`stats` 和 `summary` 均使用一致只读 SQLite 事务，可读取旧 v1，不进行迁移；不存在的DB报错，不创建新账本。旧事件缺少的新指标保持缺失，不根据现时数据重算。
+
+`circuit_intervals` 记录原因、已知 start/end、持续秒数和实际被熔断拒绝的信号尝试数；每次尝试另写 `circuit_signal_rejected`，不受 `order_rejected` 去重影响。这里“信号尝试”遵循原每30秒节流：被节流抑制的策略评估、因盘口无效提前返回或已达窗口上限的评估不算新订单。持久熔断跨重启保持同一区间、原起始进程和累计次数；各进程首次观察区间的记录保存在 `circuit_runs`。正常重启不会创建新的熔断起点。原因被更高优先级原因替换时关闭旧区间并打开新原因区间；手动/自动重置关闭区间，均不改变现有熔断决策。
+
+升级前已活跃熔断的历史起点无法确定：`started/start_run_id/duration_seconds` 保持 `null`，只记录升级后 `observed_since` 和新尝试计数，不扫描旧事件推测起点/次数。已知区间的持续时间是持久熔断墙钟时间，包含进程停机时段；仍活跃时显示截至 `duration_as_of` 的时长。统计按区间与时间范围重叠及进程参与筛选；区间完整生命周期的 `rejected_signals/duration_seconds` 与范围内 `selected_rejected_signals` 分列，不把跨范围总数伪装成局部计数。
+
+写入端识别 v1 后，将表结构以单个事务幂等升级至 **schema_version=2**：新增可空 `events.run_id`、索引和权益/熔断观测表，保留所有旧金额、订单、成交、结算和事件内容；DDL失败则回滚整个升级。未知未来版本在任何DDL/写入及WAL模式修改之前拒绝。只读命令不会升级；v2账本需要支持v2的写入程序，不能由旧v1程序继续写入。迁移仅由后续获准运行的新写入进程执行，文档中的统计命令不会重启当前服务。
 
 ## 紧急停止和恢复
 
@@ -143,7 +179,7 @@ uv run --locked btc5m stop
 uv run --locked btc5m status
 ```
 
-`reset-circuit` 有审计事件并重置亏损连续计数；不改变现金、日亏损、未结算敞口和订单去重。日亏损风控仍然有效。不要删 DB 来“修复”风控；应停机备份整个运行目录。本次保留 schema_version=1 和既有 orders/fills/settlements 记录，启动时幂等增加 `order_windows` 映射并将旧订单计入原窗口额度；额外成交使用独立订单ID（窗口slug加序号），每笔单独结算，`pending`按未结算订单计数。旧记录的金额和审计事件不重写；未知版本拒绝启动。
+`reset-circuit` 有审计事件并重置亏损连续计数；不改变现金、日亏损、未结算敞口和订单去重。日亏损风控仍然有效。不要删 DB 来“修复”风控；应停机备份整个运行目录。账本保留既有 orders/fills/settlements 记录，`order_windows` 映射将旧订单计入原窗口额度；额外成交使用独立订单ID（窗口slug加序号），每笔单独结算，`pending`按未结算订单计数。旧记录的金额和审计事件不重写；schema 迁移规则见下文。
 
 ## 撮合、结算和限制
 

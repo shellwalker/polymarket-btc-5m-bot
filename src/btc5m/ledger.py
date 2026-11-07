@@ -9,10 +9,13 @@ from contextlib import closing
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from uuid import uuid4
 
 from btc5m.config import Settings
 from btc5m.domain import ONE, ZERO, Book, Market, Signal, array, fee, number
+from btc5m.schema import SUPPORTED_VERSIONS, migrate
+from btc5m.telemetry import current_run_id, equity_snapshot, quote_snapshot
 
 
 class Rejected(ValueError):
@@ -23,52 +26,31 @@ TRANSIENT_BREAKERS = frozenset({"abnormal_spread", "stale_or_disconnected_book"}
 
 
 class Ledger:
-    def __init__(self, path: Path, settings: Settings):
+    def __init__(self, path: Path, settings: Settings, *, run_id: str | None = None):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.settings = settings
+        self.run_id = run_id or current_run_id()
         self.clear_recovery_progress()
         self.db = sqlite3.connect(path, timeout=5)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS orders(
-                slug TEXT PRIMARY KEY, market TEXT NOT NULL, outcome TEXT NOT NULL,
-                quantity TEXT NOT NULL, cost TEXT NOT NULL, fee TEXT NOT NULL,
-                created REAL NOT NULL, settled INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS order_windows(
-                order_id TEXT PRIMARY KEY REFERENCES orders(slug), window_slug TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS order_windows_slug ON order_windows(window_slug);
-            CREATE TABLE IF NOT EXISTS fills(
-                slug TEXT NOT NULL REFERENCES orders(slug), level INTEGER NOT NULL,
-                price TEXT NOT NULL, quantity TEXT NOT NULL, fee TEXT NOT NULL,
-                PRIMARY KEY(slug,level));
-            CREATE TABLE IF NOT EXISTS settlements(
-                slug TEXT PRIMARY KEY REFERENCES orders(slug), winner TEXT NOT NULL,
-                payout TEXT NOT NULL,pnl TEXT NOT NULL,created REAL NOT NULL,
-                evidence TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS daily(day TEXT PRIMARY KEY,loss TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS events(
-                id INTEGER PRIMARY KEY,kind TEXT NOT NULL,
-                payload TEXT NOT NULL,created REAL NOT NULL);
-        """)
-        with self.db:
-            self.db.execute("INSERT OR IGNORE INTO order_windows SELECT slug,slug FROM orders")
-            self.db.execute(
-                "INSERT OR IGNORE INTO meta VALUES ('cash',?)", (str(settings.initial_cash),)
-            )
-            self.db.execute(
-                "INSERT OR IGNORE INTO meta VALUES ('initial_cash',?)",
-                (str(settings.initial_cash),),
-            )
-            self.db.execute("INSERT OR IGNORE INTO meta VALUES ('consecutive_losses','0')")
-            self.db.execute("INSERT OR IGNORE INTO meta VALUES ('circuit','')")
-            self.db.execute("INSERT OR IGNORE INTO meta VALUES ('schema_version','1')")
-        if self._meta("schema_version") != "1":
-            self.close()
-            raise ValueError("unsupported ledger schema version")
+        try:
+            migrate(self.db, settings.initial_cash)
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=FULL")
+            self.db.execute("PRAGMA foreign_keys=ON")
+            # The historical circuit start cannot be inferred from pre-upgrade events.
+            with self.db:
+                if self._meta("circuit") and self._active_interval() is None:
+                    self.db.execute(
+                        "INSERT INTO circuit_intervals(reason,observed_since) VALUES (?,?)",
+                        (self._meta("circuit"), time.time()),
+                    )
+                active = self._active_interval()
+                if active is not None:
+                    self._observe_interval_run(active["id"], time.time())
+        except BaseException:
+            self.db.close()
+            raise
 
     def _meta(self, key: str) -> str:
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -80,14 +62,79 @@ class Ledger:
         self.db.execute("UPDATE meta SET value=? WHERE key=?", (str(value), key))
 
     def _event(self, kind: str, payload: dict[str, Any], now: float) -> None:
+        payload = {**payload, "run_id": self.run_id}
         self.db.execute(
-            "INSERT INTO events(kind,payload,created) VALUES (?,?,?)",
-            (kind, json.dumps(payload, sort_keys=True, default=str), now),
+            "INSERT INTO events(kind,payload,created,run_id) VALUES (?,?,?,?)",
+            (kind, json.dumps(payload, sort_keys=True, default=str), now, self.run_id),
         )
 
     def event(self, kind: str, payload: dict[str, Any], now: float) -> None:
         with self.db:
             self._event(kind, payload, now)
+
+    def _active_interval(self) -> sqlite3.Row | None:
+        return cast(
+            sqlite3.Row | None,
+            self.db.execute("SELECT * FROM circuit_intervals WHERE ended IS NULL").fetchone(),
+        )
+
+    def _observe_interval_run(self, interval_id: int, now: float) -> None:
+        self.db.execute(
+            "INSERT OR IGNORE INTO circuit_runs VALUES (?,?,?)", (interval_id, self.run_id, now)
+        )
+
+    def _close_interval(self, now: float) -> None:
+        row = self._active_interval()
+        if row is None:
+            return
+        self.db.execute(
+            "UPDATE circuit_intervals SET ended=?,end_run_id=? WHERE id=?",
+            (now, self.run_id, row["id"]),
+        )
+        self._event(
+            "circuit_interval_closed",
+            {
+                "interval_id": row["id"],
+                "reason": row["reason"],
+                "start": row["started"],
+                "end": now,
+                "duration_seconds": now - row["started"] if row["started"] is not None else None,
+                "observed_since": row["observed_since"],
+                "rejected_signals": row["rejected_signals"],
+                "start_run_id": row["start_run_id"],
+            },
+            now,
+        )
+
+    def _begin_interval(self, reason: str, now: float) -> None:
+        self._close_interval(now)
+        self.db.execute(
+            "INSERT INTO circuit_intervals(reason,started,observed_since,start_run_id) "
+            "VALUES (?,?,?,?)",
+            (reason, now, now, self.run_id),
+        )
+        active = self._active_interval()
+        assert active is not None
+        self._observe_interval_run(active["id"], now)
+
+    def _count_circuit_rejection(self, signal_id: str | None, attempt_id: str, now: float) -> None:
+        interval = self._active_interval()
+        if interval is None:
+            return
+        self.db.execute(
+            "UPDATE circuit_intervals SET rejected_signals=rejected_signals+1 WHERE id=?",
+            (interval["id"],),
+        )
+        self._event(
+            "circuit_signal_rejected",
+            {
+                "interval_id": interval["id"],
+                "reason": interval["reason"],
+                "signal_id": signal_id,
+                "attempt_id": attempt_id,
+            },
+            now,
+        )
 
     def trip(self, reason: str, now: float) -> None:
         with self.db:
@@ -95,6 +142,7 @@ class Ledger:
             if not previous or (
                 previous in TRANSIENT_BREAKERS and reason not in TRANSIENT_BREAKERS
             ):
+                self._begin_interval(reason, now)
                 self._put("circuit", reason)
                 self.clear_recovery_progress()
                 self._event("circuit_breaker", {"reason": reason}, now)
@@ -135,6 +183,7 @@ class Ledger:
         with self.db:
             if self._meta("circuit") != reason:
                 return
+            self._close_interval(now)
             self._put("circuit", "")
             self._event(
                 "circuit_reset",
@@ -156,8 +205,10 @@ class Ledger:
 
     def reset_circuit(self, now: float | None = None) -> None:
         """Explicit operator action only; never called as a consequence of restart."""
+        now = time.time() if now is None else now
         with self.db:
             self.clear_recovery_progress()
+            self._close_interval(now)
             previous = self._meta("circuit")
             previous_streak = self._meta("consecutive_losses")
             self._put("circuit", "")
@@ -165,7 +216,7 @@ class Ledger:
             self._event(
                 "circuit_reset",
                 {"previous_reason": previous, "previous_consecutive_losses": int(previous_streak)},
-                time.time() if now is None else now,
+                now,
             )
 
     def has_order(self, slug: str) -> bool:
@@ -215,8 +266,121 @@ class Ledger:
             reasons.append("consecutive loss limit reached")
         return reasons
 
+    def pending_positions(self) -> list[dict[str, Any]]:
+        positions = []
+        for row in self.db.execute("SELECT * FROM orders WHERE settled=0 ORDER BY created,slug"):
+            market = Market.from_dict(json.loads(row["market"]))
+            positions.append(
+                {
+                    "order_id": row["slug"],
+                    "slug": market.slug,
+                    "outcome": row["outcome"],
+                    "token": market.tokens[row["outcome"]],
+                    "quantity": row["quantity"],
+                    "tick": str(market.tick),
+                }
+            )
+        return positions
+
+    def latest_equity(self) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT payload FROM equity_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def record_equity(self, books: dict[str, Book], now: float) -> dict[str, Any]:
+        with self.db:
+            previous = self.latest_equity()
+            result = equity_snapshot(
+                number(self._meta("cash")),
+                self.pending_positions(),
+                books,
+                now,
+                self.settings.valuation_stale_seconds,
+                previous["drawdown"] if previous else {},
+            )
+            result["run_id"] = self.run_id
+            self.db.execute(
+                "INSERT INTO equity_snapshots(created,run_id,payload) VALUES (?,?,?)",
+                (now, self.run_id, json.dumps(result, sort_keys=True)),
+            )
+        return result
+
     def execute(
-        self, market: Market, book: Book, signal: Signal, now: float
+        self,
+        market: Market,
+        book: Book,
+        signal: Signal,
+        now: float,
+        *,
+        audit: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Observe an attempt without changing its existing decision timestamp or checks."""
+        audit = audit or {}
+        order_at = audit.get("order_at", now)
+        order_quote = quote_snapshot(book, order_at, self.settings.stale_seconds)
+        signal_quote = audit.get("signal_quote")
+        signal_ask = signal_quote.get("best_ask") if signal_quote else None
+        order_ask = order_quote["best_ask"]
+        context = {
+            "signal_id": audit.get("signal_id"),
+            "order_id": None,
+            "attempt_id": str(uuid4()),
+            "signal_at": audit.get("signal_at"),
+            "order_at": order_at,
+            "decision_at": now,
+            "signal_quote": signal_quote,
+            "order_quote": order_quote,
+            "signal_to_order_move": str(number(order_ask) - number(signal_ask))
+            if order_ask is not None and signal_ask is not None
+            else None,
+            "execution_slippage": None,
+            "fill_ladder": None,
+            "run_id": self.run_id,
+            "slug": market.slug,
+            "outcome": signal.outcome,
+            "quantity": str(signal.quantity),
+            "limit": str(signal.limit_price),
+        }
+        self.event("order_attempt", context, order_at)
+        circuit = self._meta("circuit")
+        try:
+            result = self._execute(market, book, signal, now, context)
+        except BaseException as exc:
+            # _execute has rolled back trading mutations. Each rejected attempt is
+            # audited even if Service deduplicates its human-readable rejection log.
+            with self.db:
+                self._event(
+                    "order_result",
+                    {
+                        **context,
+                        "status": "rejected" if isinstance(exc, Rejected) else "error",
+                        "reason": str(exc),
+                    },
+                    order_at,
+                )
+                if (
+                    circuit
+                    and isinstance(exc, Rejected)
+                    and str(exc).startswith("circuit breaker active:")
+                ):
+                    self._count_circuit_rejection(
+                        context["signal_id"], context["attempt_id"], order_at
+                    )
+            raise
+        self.event(
+            "order_result",
+            {
+                **(result or context),
+                "status": "filled" if result else "window_limit",
+                "order_id": result["order_id"] if result else None,
+            },
+            order_at,
+        )
+        return result
+
+    def _execute(
+        self, market: Market, book: Book, signal: Signal, now: float, audit: dict[str, Any]
     ) -> dict[str, Any] | None:
         """All-or-none taker fill with a durable per-window successful entry allowance.
 
@@ -306,6 +470,7 @@ class Ledger:
                 )
             self._put("cash", cash - debit)
             result = {
+                **audit,
                 "slug": market.slug,
                 "order_id": order_id,
                 "entry": entry,
@@ -317,8 +482,15 @@ class Ledger:
                 "reason": signal.reason,
                 "levels": len(fills),
                 **settings.fee_assumption(),
+                "fill_ladder": [
+                    {"price": str(price), "quantity": str(qty), "fee": str(amount)}
+                    for price, qty, amount in fills
+                ],
+                "execution_slippage": str(
+                    cost / quantity - number(audit["order_quote"]["best_ask"])
+                ),
             }
-            self._event("paper_fill", result, now)
+            self._event("paper_fill", result, audit["order_at"])
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -411,6 +583,7 @@ class Ledger:
                 if reason and (
                     not self._meta("circuit") or self._meta("circuit") in TRANSIENT_BREAKERS
                 ):
+                    self._begin_interval(reason, now)
                     self._put("circuit", reason)
                     self._event("circuit_breaker", {"reason": reason}, now)
                 result = {
@@ -461,7 +634,7 @@ class Ledger:
                 raise ValueError(f"missing ledger state: {key}")
             return str(row[0])
 
-        if meta("schema_version") != "1":
+        if meta("schema_version") not in SUPPORTED_VERSIONS:
             raise ValueError("unsupported ledger schema version")
         exposure = sum(
             (

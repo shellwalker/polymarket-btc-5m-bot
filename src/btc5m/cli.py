@@ -20,15 +20,21 @@ from .config import Settings
 from .ledger import Ledger
 from .public import PublicAPI
 from .service import RuntimeLock, Service, read_status
+from .stats import read_stats, timestamp
+from .telemetry import current_run_id
 
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        details = dict(getattr(record, "details", {}))
+        run_id = getattr(record, "run_id", None) or details.get("run_id") or current_run_id()
+        details["run_id"] = run_id
         result = {
+            "run_id": run_id,
             "time": record.created,
             "level": record.levelname,
             "event": record.getMessage(),
-            "details": getattr(record, "details", {}),
+            "details": details,
         }
         if record.exc_info:
             result["exception"] = self.formatException(record.exc_info)
@@ -73,14 +79,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="BTC 5m paper-only public-data service")
     parser.add_argument("--config", type=Path, help="strict TOML; BTC5M_* environment overrides")
     parser.add_argument(
-        "command", choices=["run", "start", "status", "health", "summary", "stop", "reset-circuit"]
+        "command",
+        choices=["run", "start", "status", "health", "summary", "stats", "stop", "reset-circuit"],
     )
+    parser.add_argument("--since", help="stats: inclusive epoch or ISO with explicit zone")
+    parser.add_argument("--until", help="stats: exclusive epoch or ISO with explicit zone")
+    parser.add_argument("--run-id", help="stats: process UUID, or legacy for NULL attribution")
     args = parser.parse_args()
     try:
+        if args.command != "stats" and any((args.since, args.until, args.run_id)):
+            raise ValueError("time/run filters require stats")
         settings = Settings.load(args.config)
         directory = settings.runtime_dir.resolve()
         if args.command in {"status", "health"}:
             emit(read_status(directory))
+        elif args.command == "stats":
+            emit(
+                read_stats(
+                    directory / "ledger.sqlite3",
+                    since=timestamp(args.since) if args.since is not None else None,
+                    until=timestamp(args.until) if args.until is not None else None,
+                    run_id=args.run_id,
+                )
+            )
         elif args.command == "summary":
             emit(Ledger.read_summary(directory / "ledger.sqlite3"))
         elif args.command == "stop":

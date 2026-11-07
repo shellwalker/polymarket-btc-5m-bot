@@ -138,3 +138,48 @@ PublicAPI.get=offline
             if child.poll() is None:
                 child.kill()
                 child.wait()
+
+
+def test_stats_cli_is_read_only_filters_and_rejects_naive_time(tmp_path):
+    from btc5m.config import Settings
+    from btc5m.ledger import Ledger
+
+    ledger = Ledger(tmp_path / "ledger.sqlite3", Settings(), run_id="test-run")
+    ledger.event("sample", {}, 1800000000)
+    ledger.record_equity({}, 1800000000)
+    ledger.close()
+    path = tmp_path / "ledger.sqlite3"
+    before = path.read_bytes()
+    result = cli(
+        tmp_path, "stats", "--since", "1799999999", "--until", "1800000001", "--run-id", "test-run"
+    )
+    assert result.returncode == 0, result.stderr
+    stat = json.loads(result.stdout)
+    assert stat["event_counts"] == {"sample": 1}
+    assert stat["equity_snapshot_count"] == 1
+    assert path.read_bytes() == before
+    result = cli(tmp_path, "stats", "--since", "2026-11-07T10:00:00")
+    assert result.returncode == 2 and "timezone" in result.stderr
+    assert path.read_bytes() == before
+    absent = tmp_path / "missing"
+    absent.mkdir()
+    assert cli(absent, "stats").returncode == 2
+    assert not (absent / "ledger.sqlite3").exists()
+
+
+def test_run_id_changes_between_processes_and_covers_all_event_rows(tmp_path):
+    import sqlite3
+
+    (tmp_path / "STOP").touch()
+    assert cli(tmp_path, "run").returncode == 0
+    assert cli(tmp_path, "run").returncode == 0
+    with sqlite3.connect(tmp_path / "ledger.sqlite3") as db:
+        rows = db.execute("SELECT run_id,payload FROM events").fetchall()
+        runs = db.execute(
+            "SELECT DISTINCT run_id FROM events WHERE kind='service_stopped'"
+        ).fetchall()
+    assert len(runs) == 2
+    assert all(run_id and json.loads(payload)["run_id"] == run_id for run_id, payload in rows)
+    logs = [json.loads(line) for line in (tmp_path / "logs/paper.jsonl").read_text().splitlines()]
+    assert {r["run_id"] for r in logs} == {r[0] for r in runs}
+    assert all(r["details"]["run_id"] == r["run_id"] for r in logs)

@@ -51,6 +51,8 @@ class Settings:
     retry_max: float = 30.0
     heartbeat_seconds: float = 10.0
     pong_timeout: float = 20.0
+    equity_snapshot_seconds: float = 15.0
+    valuation_stale_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         if self.live:
