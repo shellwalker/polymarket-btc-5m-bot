@@ -122,6 +122,26 @@ class Ledger:
     def _day(now: float) -> str:
         return datetime.fromtimestamp(now, UTC).date().isoformat()
 
+    def risk_blocked_reasons(self, debit: Decimal, now: float) -> list[str]:
+        """Read-only risk preview; execute repeats these checks inside its transaction."""
+        settings = self.settings
+        reasons = []
+        if self._meta("circuit"):
+            reasons.append("circuit breaker active: " + self._meta("circuit"))
+        if debit > settings.max_trade:
+            reasons.append("per-trade cap exceeded including fees")
+        exposure = self._exposure()
+        if exposure + debit > settings.max_exposure:
+            reasons.append("total exposure cap exceeded")
+        if debit > number(self._meta("cash")):
+            reasons.append("insufficient paper cash")
+        daily = self.db.execute("SELECT loss FROM daily WHERE day=?", (self._day(now),)).fetchone()
+        if (number(daily[0]) if daily else ZERO) + exposure + debit > settings.daily_loss_limit:
+            reasons.append("daily loss limit including worst-case pending exposure")
+        if int(self._meta("consecutive_losses")) >= settings.max_consecutive_losses:
+            reasons.append("consecutive loss limit reached")
+        return reasons
+
     def execute(
         self, market: Market, book: Book, signal: Signal, now: float
     ) -> dict[str, Any] | None:
@@ -172,7 +192,7 @@ class Ledger:
                     break
                 take = min(remaining, available)
                 if take > ZERO:
-                    fills.append((price, take, fee(take, price)))
+                    fills.append((price, take, fee(take, price, settings.paper_fee_rate)))
                     remaining -= take
                 if remaining == ZERO:
                     break
@@ -181,20 +201,10 @@ class Ledger:
             cost = sum((price * qty for price, qty, _ in fills), ZERO)
             fees = sum((amount for _, _, amount in fills), ZERO)
             debit = cost + fees
-            if debit > settings.max_trade:
-                raise Rejected("per-trade cap exceeded including fees")
-            if self._exposure() + debit > settings.max_exposure:
-                raise Rejected("total exposure cap exceeded")
+            blocked = self.risk_blocked_reasons(debit, now)
+            if blocked:
+                raise Rejected("; ".join(blocked))
             cash = number(self._meta("cash"))
-            if debit > cash:
-                raise Rejected("insufficient paper cash")
-            day = self._day(now)
-            daily = self.db.execute("SELECT loss FROM daily WHERE day=?", (day,)).fetchone()
-            daily_loss = number(daily[0]) if daily else ZERO
-            if daily_loss + self._exposure() + debit > settings.daily_loss_limit:
-                raise Rejected("daily loss limit including worst-case pending exposure")
-            if int(self._meta("consecutive_losses")) >= settings.max_consecutive_losses:
-                raise Rejected("consecutive loss limit reached")
             self.db.execute(
                 "INSERT INTO orders(slug,market,outcome,quantity,cost,fee,created) "
                 "VALUES (?,?,?,?,?,?,?)",
@@ -223,6 +233,7 @@ class Ledger:
                 "average_price": str(cost / quantity),
                 "reason": signal.reason,
                 "levels": len(fills),
+                **settings.fee_assumption(),
             }
             self._event("paper_fill", result, now)
             self.db.commit()

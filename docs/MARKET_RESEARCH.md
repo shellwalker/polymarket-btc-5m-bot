@@ -21,7 +21,7 @@
 
 [官方费用说明](https://docs.polymarket.com/trading/fees) 的 crypto taker 系数是0.07，费用依数量及价格的 `C*rate*p*(1-p)` 计算，精度5位；maker免手续费。本轮 Gamma 实测 `feesEnabled=true`、`feeType=crypto_fees_v2`，feeSchedule rate=.07、exponent=1、takerOnly=true，与文档一致。100份价格.5对应1.75，价格.1对应.63。旧 `/fee-rate` 的 base_fee 不是本程序的费用来源。
 
-本程序每市场重新校验 schedule，未知 schema 拒绝交易。每档 ROUND_HALF_UP 再求和是模拟器的明确选择；官方实际 match 拆分粒度与五位边界的具体舍入模式没有独立核实，可能存在微小差异。没有 maker 或返佣模拟，也不允许用户任意覆盖已核实费率。
+本程序每市场重新校验 schedule，未知 schema 拒绝交易。每档 ROUND_HALF_UP 再求和是模拟器的明确选择；官方实际 match 拆分粒度与五位边界的具体舍入模式没有独立核实，可能存在微小差异。没有 maker 或返佣模拟，官方schedule校验不能覆盖；可用paper_fee_multiplier>=1保守放大模拟费用，纯属paper假设而非官方费率。
 
 [官方结算说明](https://docs.polymarket.com/concepts/resolution) 及上述实际 market description 指向 Chainlink BTC/USD 60秒 TWAP：开始和结束的同一流 TWAP 比较，结束不小于开始为 Up，平局 Up；不是现货猜测，也不经过通常的 UMA 提案争议流程。MVP 不自行采样重建 TWAP，而等待官方终态：唯一1/0结果、closed、resolved且 condition/token 身份匹配才入账。当前兼容字段叫 `umaResolutionStatus`，是观察到的终态标记；若 Chainlink 市场迁移终态字段，则保持 pending，不盲猜。
 

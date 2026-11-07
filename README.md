@@ -2,7 +2,6 @@
 
 完整的只读行情模拟程序：每个 300 秒窗口自动发现独立市场，CLOB WebSocket 维护盘口，Decimal 逐档模拟 taker 买入，SQLite 持久化现金、费用、风控和官方结算结果。**唯一模式是 paper；没有真实下单、钱包、签名、授权或认证 SDK。`live=true` 直接拒绝启动。没有收益保证。**
 
-本次开发仅在授权的共享 box checkout、`feature/mvp-paper-trading` 分支进行；未接触 Mac。首稿供协调者审查，未推送、未开 PR、未启动长期服务。
 
 ## 安装与检查
 
@@ -16,7 +15,7 @@ uv run --locked mypy src
 uv run --locked pytest -q
 ```
 
-所有测试离线运行，REST 使用 MockTransport，WS 使用模拟流。包括两个连续窗口、真实适配器、断线重订阅/REST 重同步、官方结算、事务回滚、重启去重及进程信号退出。GitHub Actions 对 Python 3.11/3.12 执行相同检查，并用 gitleaks 扫描完整 Git 历史和工作树。未推送前不能声称远端 CI 已通过。
+所有测试离线运行，REST 使用 MockTransport，WS 使用模拟流。包括两个连续窗口、真实适配器、断线重订阅/REST 重同步、官方结算、事务回滚、重启去重及进程信号退出。GitHub Actions 对 Python 3.11/3.12 执行相同检查，并用 gitleaks 扫描完整 Git 历史和工作树。具体版本的本地验证和远端 CI 状态应以相应验收记录及 Actions 结果为准。
 
 ## 配置
 
@@ -33,6 +32,7 @@ max_exposure = "50"
 daily_loss_limit = "20"
 max_consecutive_losses = 3
 shares = "5"
+paper_fee_multiplier = "1"
 signal_threshold = "0.03"
 min_momentum = "0.03"
 max_entry_price = "0.85"
@@ -49,6 +49,7 @@ min_time_remaining = 30
 | max_exposure | 50 | 所有待结算持仓成本加费用上限 |
 | daily_loss_limit | 20 | UTC 当日已实现亏损总额 + 全部待结算最坏损失 + 新单最坏损失上限；盈利不抵消亏损 |
 | max_consecutive_losses | 3 | 连续已结算亏损触发持久熔断 |
+| paper_fee_multiplier | 1 | 纯模拟费用保守倍数，有限 Decimal 且必须 >=1；模拟系数为已核实0.07乘此值，不改变官方schema校验 |
 | shares | 5 | 每次信号目标份数；必须满足该市场最小数量 |
 | signal_threshold / min_momentum | 0.03 / 0.03 | Up midpoint 相对本窗口首次健康观测的变动，须同时超过两者 |
 | max_entry_price | 0.85 | 买入价格上限 |
@@ -61,11 +62,11 @@ min_time_remaining = 30
 | retry_initial / retry_max | 1 / 30 秒 | 指数退避；WS 稳定 30 秒后恢复初始退避 |
 | heartbeat_seconds / pong_timeout | 10 / 20 秒 | 文本 PING/PONG；行情流量不能代替 PONG |
 
-策略接口是 `Strategy.signal()`。自带基线记录**本次进程在窗口内首次健康的 Up midpoint**，变动向上买 Up、向下买 Down；必须满足幅度、价差、价格、费用及滑点过滤。窗口中途启动不会假装知道开盘价格；重启重新建立观测锚点。无信号就不成交。每窗口最多一笔持久化成交，绝不为了展示结果强制交易。
+策略接口是 `Strategy.signal()`。自带基线记录**本次进程在窗口内首次健康的 Up midpoint**，变动向上买 Up、向下买 Down；必须满足幅度、价差、价格、费用及滑点过滤。窗口中途启动不会假装知道开盘价格；重启重新建立观测锚点。无信号就不成交。每窗口最多一笔持久化成交，绝不为了展示结果强制交易。未成交时，同一窗口/方向的信号与尝试最多每30秒一次，防止持续风控拒绝淹没日志；新方向可独立评估，成功成交后仍由账本去重。
 
 ## 运行、状态、日志和损益
 
-以下命令供审查后使用；本次交付没有启动长期服务。无 cron/systemd。
+支持前台运行和独立后台进程，不依赖 cron/systemd。
 
 ```bash
 # 前台，Ctrl-C/SIGTERM 干净退出
@@ -81,7 +82,7 @@ uv run --locked btc5m summary
 tail -f runtime/logs/paper.jsonl
 ```
 
-`status/health` 以独占锁检测进程，pidfile 只是诊断信息；`trading_ready` 同时要求健康盘口、当前可入场时间和无熔断。`health.json` 的 `updated` 可识别进程卡住，`running=true` 仅说明仍持锁，不代表交易可用。地理查询原样记录（此 box 实测 `blocked=true, US/CA`），公共数据可达时允许只读 paper，不绕过限制。HTTP 忽略环境代理、WS 禁用代理。
+`status/health` 以独占锁检测进程，pidfile 只是诊断信息；`trading_ready` 同时要求健康盘口、当前可入场时间、无停止请求/熔断，以及至少一个方向的最小交易通过现金、日亏损预留、总敞口和单笔预算检查。`risk_blocked_reasons` 显示阻止最小交易的原因；这是健康预检，不保证策略指定的更大数量一定可成交，实际成交仍在事务内重新检查。`health.json` 的 `updated` 可识别进程卡住，`running=true` 仅说明仍持锁，不代表交易可用。地理查询原样记录（此 box 实测 `blocked=true, US/CA`），公共数据可达时允许只读 paper，不绕过限制。HTTP 忽略环境代理、WS 禁用代理。
 
 运行目录固定包含 `ledger.sqlite3`（WAL/FULL 同步）、`process.lock`、`pid.json`、`health.json`、`STOP` 和日志。`paper.jsonl` 单文件 5 MB、保留 5 个备份；`launcher.log` 记录后台启动错误。SQLite 是审计事实来源；`events` 包含 signal、拒绝、成交、结算、熔断及状态事件，`orders/fills/settlements/daily/meta` 保存账本。行情原始帧不全量保存，DB 不自动删除审计记录。
 
@@ -112,7 +113,7 @@ uv run --locked btc5m start
 ## 撮合、结算和限制
 
 - 仅模拟买入 taker，按 ask 从低到高逐档成交。每档遵守 tick/滑点/限价，整单数量不足则拒绝；扣减深度与持久窗口去重共同避免重复使用。不是 maker 队列或部分成交模拟。
-- 每个价格档手续费 `C × 0.07 × p × (1-p)`，四舍五入至 5 位小数后求和；此逐档聚合及 HALF_UP 是明确的模拟假设，不模拟返佣、链上费用和真实 match 拆分。
+- 每个价格档默认手续费 `C × 0.07 × p × (1-p)`；可设置 `paper_fee_multiplier`（例如2）做保守压力测试，策略费用过滤和每档撮合统一使用 `0.07 × paper_fee_multiplier`，四舍五入至 5 位小数后求和；此逐档聚合及 HALF_UP 是明确的模拟假设，不模拟返佣、链上费用和真实 match 拆分。health、启动日志/事件和成交审计事件记录 `verified_fee_rate`、`paper_fee_multiplier`、`paper_fee_rate`；倍数只是paper假设，绝非实时费率声明。重启修改倍数只影响后续信号/新成交，不追改既有费用。
 - 每次发现验证该市场 `crypto_fees_v2` / exponent=1 / rate=0.07 / takerOnly=true。仅支持已观察的 v1 token schema、BTC 60s TWAP 规则配置；v2/未知费用和规则均停止新交易。
 - 重连时全盘口失效，重新订阅、REST 重同步，再经过 WS 初始快照屏障恢复；旧时间戳不覆盖新数据。没有 WS 序号可做绝对缺口证明，同毫秒事件按接收顺序处理；异常时断开并 resync。
 - 到窗口结束不再开仓；只接受官方 Gamma `closed=true`、`umaResolutionStatus=resolved` 且 token/condition 精确匹配、结果唯一为 1/0 的结算。该字段名不意味着本程序执行 UMA：当前 BTC 规则使用 Chainlink 60s TWAP，平局 Up。绝不拿现货或时间到期猜赢家。

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from .config import Settings
-from .domain import Book, Market, MomentumStrategy
+from .domain import ZERO, Book, Market, MomentumStrategy, fee
 from .ledger import Ledger, Rejected
 from .public import MarketStream
 
@@ -97,6 +97,8 @@ class Service:
         self.ledger: Ledger | None = None
         self.stream: MarketStream | None = None
         self.stream_task: asyncio.Task[None] | None = None
+        self.stop = asyncio.Event()
+        self.signal_last: dict[tuple[str, str], float] = {}
         self.stream_stop = asyncio.Event()
         self.ever_ready = False
         self.switching = False
@@ -109,6 +111,9 @@ class Service:
             self.ledger.event(kind, details, self.clock())
 
     def update(self) -> None:
+        # The same event is set by SIGTERM/SIGINT; guard before any ledger mutation.
+        if self.stop.is_set() or (self.settings.runtime_dir / "STOP").exists():
+            return
         if self.ledger is None or self.market is None or self.switching:
             return
         now = self.clock()
@@ -136,6 +141,10 @@ class Service:
         signal = self.strategy.signal(self.market, self.books, now)
         if signal is None:
             return
+        decision = (self.market.slug, signal.outcome)
+        if now - self.signal_last.get(decision, float("-inf")) < 30:
+            return
+        self.signal_last[decision] = now
         self.record(
             "signal",
             {
@@ -170,6 +179,9 @@ class Service:
             self.last_rejection = ""
             if market is None:
                 return
+            self.signal_last = {
+                key: stamp for key, stamp in self.signal_last.items() if key[0] == market.slug
+            }
             self.books = {token: Book(token, market.tick) for token in market.tokens.values()}
             self.stream_stop = asyncio.Event()
             kwargs = {} if self.connect is None else {"connect": self.connect}
@@ -181,6 +193,36 @@ class Service:
         finally:
             self.switching = False
 
+    def risk_blocked_reasons(self, now: float) -> list[str]:
+        if self.ledger is None or self.market is None:
+            return ["no active market or ledger"]
+        if self.ledger.has_order(self.market.slug):
+            return ["window already filled"]
+        candidates = []
+        for book in self.books.values():
+            if not book.healthy(now, self.settings.stale_seconds) or book.best_ask is None:
+                continue
+            quantity = max(self.market.min_size, book.min_size or self.market.min_size)
+            remaining, debit = quantity, ZERO
+            for price, available in sorted(book.asks.items()):
+                if (
+                    price > self.settings.max_entry_price
+                    or price - book.best_ask > self.settings.max_slippage
+                ):
+                    break
+                take = min(remaining, available)
+                debit += price * take + fee(take, price, self.settings.paper_fee_rate)
+                remaining -= take
+                if remaining == ZERO:
+                    break
+            if remaining == ZERO:
+                candidates.append(self.ledger.risk_blocked_reasons(debit, now))
+        if not candidates:
+            return ["minimum trade unavailable within depth/price/slippage limits"]
+        if any(not reasons for reasons in candidates):
+            return []
+        return sorted({reason for reasons in candidates for reason in reasons})
+
     def health(self, *, stopped: bool = False) -> None:
         now = self.clock()
         healthy = (
@@ -191,6 +233,7 @@ class Service:
             and all(b.healthy(now, self.settings.stale_seconds) for b in self.books.values())
         )
         summary = self.ledger.summary() if self.ledger is not None else {}
+        risk_blocked = self.risk_blocked_reasons(now)
         atomic_json(
             self.settings.runtime_dir / "health.json",
             {
@@ -203,6 +246,8 @@ class Service:
                 "connected": self.stream.ready if self.stream else False,
                 "trading_ready": bool(
                     healthy
+                    and not self.stop.is_set()
+                    and not risk_blocked
                     and not summary.get("circuit")
                     and not (self.settings.runtime_dir / "STOP").exists()
                     and self.market is not None
@@ -210,6 +255,8 @@ class Service:
                     <= now
                     < self.market.end - self.settings.min_time_remaining
                 ),
+                "risk_blocked_reasons": risk_blocked,
+                **self.settings.fee_assumption(),
                 "geoblock": self.geo,
                 "reconnects": self.stream.reconnects if self.stream else 0,
                 "summary": summary,
@@ -268,6 +315,7 @@ class Service:
             await self.pause(stop, 0.1)
 
     async def run(self, stop: asyncio.Event) -> None:
+        self.stop = stop
         settings = self.settings
         with RuntimeLock(settings.runtime_dir):
             self.ledger = Ledger(settings.runtime_dir / "ledger.sqlite3", settings)
@@ -299,7 +347,7 @@ class Service:
                     asyncio.create_task(self.periodic_discovery(stop)),
                     asyncio.create_task(self.periodic_resolution(stop)),
                 ]
-                self.record("service_started", {"mode": "paper"})
+                self.record("service_started", {"mode": "paper", **settings.fee_assumption()})
                 while not stop.is_set():
                     if (settings.runtime_dir / "STOP").exists():
                         self.record("emergency_stop", {"source": "file_or_command"})

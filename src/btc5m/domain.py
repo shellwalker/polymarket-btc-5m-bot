@@ -39,10 +39,10 @@ def window_slugs(now: float) -> tuple[str, str]:
     return f"btc-updown-5m-{start}", f"btc-updown-5m-{start + 300}"
 
 
-def fee(quantity: Decimal, price: Decimal) -> Decimal:
-    if quantity <= ZERO or not ZERO < price < ONE:
+def fee(quantity: Decimal, price: Decimal, rate: Decimal = FEE_RATE) -> Decimal:
+    if not rate.is_finite() or rate < ZERO or quantity <= ZERO or not ZERO < price < ONE:
         raise ValueError("invalid fee inputs")
-    return (quantity * FEE_RATE * price * (ONE - price)).quantize(
+    return (quantity * rate * price * (ONE - price)).quantize(
         Decimal("0.00001"), rounding=ROUND_HALF_UP
     )
 
@@ -346,7 +346,7 @@ class MomentumStrategy:
         if ask is None or bid is None or ask - bid > settings.max_spread:
             return None
         # Fee is a real cost filter, not a claimed estimate of positive expected value.
-        if abs(change) <= fee(ONE, ask) + settings.max_slippage:
+        if abs(change) <= fee(ONE, ask, settings.paper_fee_rate) + settings.max_slippage:
             return None
         limit = min(ask + settings.max_slippage, settings.max_entry_price)
         limit = (limit / book.tick).to_integral_value(rounding=ROUND_DOWN) * book.tick

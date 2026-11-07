@@ -38,6 +38,7 @@ class Settings:
     min_momentum: Decimal = Decimal("0.03")
     max_entry_price: Decimal = Decimal("0.85")
     shares: Decimal = Decimal("5")
+    paper_fee_multiplier: Decimal = Decimal("1")
     min_time_remaining: float = 30.0
     discovery_seconds: float = 5.0
     resolution_seconds: float = 15.0
@@ -58,6 +59,8 @@ class Settings:
             elif isinstance(value, (float, int)) and not isinstance(value, bool):
                 if not math.isfinite(value) or value <= 0:
                     raise ValueError(f"{field.name} must be finite and positive")
+        if self.paper_fee_multiplier < 1:
+            raise ValueError("paper_fee_multiplier must be >= 1 (conservative paper assumption)")
         if self.max_spread >= 1 or self.max_slippage >= 1 or self.max_entry_price >= 1:
             raise ValueError("price limits must be less than 1")
         if self.min_time_remaining >= 300:
@@ -68,6 +71,18 @@ class Settings:
             raise ValueError("pong_timeout must exceed heartbeat_seconds")
         if self.heartbeat_seconds > 10:
             raise ValueError("heartbeat_seconds must be <= 10")
+
+    @property
+    def paper_fee_rate(self) -> Decimal:
+        return Decimal("0.07") * self.paper_fee_multiplier
+
+    def fee_assumption(self) -> dict[str, str]:
+        return {
+            "verified_fee_rate": "0.07",
+            "paper_fee_multiplier": str(self.paper_fee_multiplier),
+            "paper_fee_rate": str(self.paper_fee_rate),
+            "fee_assumption": "paper-only conservative multiplier; not a live fee claim",
+        }
 
     @classmethod
     def load(cls, path: Path | None = None, environ: Mapping[str, str] | None = None) -> Settings:
