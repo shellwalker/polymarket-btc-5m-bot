@@ -164,11 +164,14 @@ class Book:
     def __init__(self, asset_id: str, tick: Decimal):
         self.asset_id = asset_id
         self.tick = tick
+        self.min_size: Decimal | None = None
         self.bids: dict[Decimal, Decimal] = {}
         self.asks: dict[Decimal, Decimal] = {}
         self.connected = False
         self.updated_at = 0.0
         self.source_time = 0.0
+        self.latest_trade_price: Decimal | None = None
+        self.latest_trade_time = 0.0
 
     @property
     def best_bid(self) -> Decimal | None:
@@ -214,6 +217,12 @@ class Book:
             bids, asks = self._levels(data["bids"]), self._levels(data["asks"])
             if bids and asks and max(bids) >= min(asks):
                 raise ValueError("crossed order book")
+            minimum = self.min_size
+            if "min_order_size" in data:
+                minimum = number(data["min_order_size"])
+                if minimum <= ZERO:
+                    raise ValueError("invalid minimum size")
+            self.min_size = minimum
             self.bids, self.asks = bids, asks
             self.source_time, self.updated_at, self.connected = source_time, now, True
         except (ValueError, KeyError, TypeError) as exc:
@@ -253,9 +262,39 @@ class Book:
         if any(price % tick for price in self.bids.keys() | self.asks.keys()):
             self.disconnect()
 
+    def trade(self, message: dict[str, Any], now: float) -> None:
+        """Record an observed trade without making displayed order-book depth fresher."""
+        try:
+            if message.get("asset_id") != self.asset_id:
+                raise ValueError("trade asset mismatch")
+            price, size = number(message["price"]), number(message["size"])
+            source_time = float(number(message["timestamp"]) / 1000)
+            if not ZERO < price < ONE or size <= ZERO or not 0 < source_time <= now + 2:
+                raise ValueError("invalid trade price, size or timestamp")
+            if source_time < self.latest_trade_time:
+                return
+            self.latest_trade_price, self.latest_trade_time = price, source_time
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"invalid trade: {exc}") from exc
+
+    def valid_depth(self) -> bool:
+        """Defense in depth against incompatible tick transitions or corrupt local objects."""
+        if self.tick not in {Decimal("0.1"), Decimal("0.01"), Decimal("0.001"), Decimal("0.0001")}:
+            return False
+        return all(
+            price.is_finite()
+            and size.is_finite()
+            and ZERO < price < ONE
+            and size > ZERO
+            and price % self.tick == ZERO
+            for side in (self.bids, self.asks)
+            for price, size in side.items()
+        )
+
     def healthy(self, now: float, stale_seconds: float) -> bool:
         return bool(
             self.connected
+            and self.valid_depth()
             and self.bids
             and self.asks
             and self.best_bid is not None

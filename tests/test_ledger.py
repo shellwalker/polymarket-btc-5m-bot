@@ -258,3 +258,47 @@ def test_read_summary_does_not_create_missing_db_or_accept_unknown_schema(tmp_pa
     ledger.close()
     with pytest.raises(ValueError, match="schema"):
         Ledger.read_summary(path)
+
+
+def test_has_order_persists_across_restart(tmp_path):
+    path = tmp_path / "ledger.sqlite"
+    ledger = Ledger(path, Settings())
+    market = Market.from_event(event())
+    assert not ledger.has_order(market.slug)
+    ledger.execute(market, make_book(), Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    assert ledger.has_order(market.slug)
+    ledger.close()
+    ledger = Ledger(path, Settings())
+    assert ledger.has_order(market.slug)
+
+
+def test_execution_revalidates_depth_tick_even_if_book_reports_healthy(tmp_path, monkeypatch):
+    ledger = Ledger(tmp_path / "ledger.sqlite", Settings())
+    market = Market.from_event(event())
+    book = make_book()
+    book.asks = {D("0.515"): D("10")}
+    monkeypatch.setattr(book, "healthy", lambda *_: True)
+    with pytest.raises(Rejected, match="tick"):
+        ledger.execute(market, book, Signal("Up", D("5"), D("0.53"), "test"), 1800000002)
+    assert ledger.summary()["fills"] == 0
+
+
+def test_newer_snapshot_minimum_is_respected(tmp_path):
+    book = make_book()
+    book.snapshot(
+        {
+            "asset_id": "up",
+            "timestamp": "1800000002000",
+            "min_order_size": "10",
+            "bids": [{"price": ".49", "size": "20"}],
+            "asks": [{"price": ".51", "size": "20"}],
+        },
+        1800000002,
+    )
+    ledger = Ledger(tmp_path / "ledger.sqlite", Settings())
+    with pytest.raises(Rejected, match="minimum"):
+        ledger.execute(
+            Market.from_event(event()), book, Signal("Up", D("5"), D(".53"), "test"), 1800000002
+        )
+    assert ledger.summary()["fills"] == 0
+    ledger.close()

@@ -27,3 +27,10 @@ def test_invalid_settings_refused(tmp_path, key, value):
     path.write_text(f'{key}="{value}"')
     with pytest.raises(ValueError):
         Settings.load(path, {})
+
+
+def test_live_in_file_cannot_be_hidden_by_environment(tmp_path):
+    config = tmp_path / "live.toml"
+    config.write_text("live=true\n")
+    with pytest.raises(ValueError, match="paper"):
+        Settings.load(config, {"BTC5M_LIVE": "false"})

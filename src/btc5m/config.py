@@ -75,10 +75,14 @@ class Settings:
         if path is not None:
             with path.open("rb") as stream:
                 values = tomllib.load(stream)
+            if "live" in values and _bool(values["live"]):
+                raise ValueError("live=true is forbidden: this program only supports paper trading")
         defaults = cls()
         names = {field.name for field in fields(cls)}
         environment = os.environ if environ is None else environ
         for key, value in environment.items():
+            if key == "BTC5M_LIVE" and _bool(value):
+                raise ValueError("live=true is forbidden: this program only supports paper trading")
             if key.startswith("BTC5M_"):
                 values[key.removeprefix("BTC5M_").lower()] = value
         if values.keys() - names:

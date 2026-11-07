@@ -100,6 +100,9 @@ class Ledger:
                 time.time() if now is None else now,
             )
 
+    def has_order(self, slug: str) -> bool:
+        return self.db.execute("SELECT 1 FROM orders WHERE slug=?", (slug,)).fetchone() is not None
+
     def pending(self) -> list[Market]:
         return [
             Market.from_dict(json.loads(row[0]))
@@ -144,10 +147,16 @@ class Ledger:
                 raise Rejected("signal asset mismatch")
             if not market.start <= now < market.end - settings.min_time_remaining:
                 raise Rejected("outside entry window")
+            if not book.valid_depth():
+                raise Rejected("depth price or size violates tick")
             if not book.healthy(now, settings.stale_seconds):
                 raise Rejected("stale or disconnected book")
             quantity, limit = signal.quantity, signal.limit_price
-            if not quantity.is_finite() or quantity < market.min_size or quantity <= ZERO:
+            if (
+                not quantity.is_finite()
+                or quantity < max(market.min_size, book.min_size or market.min_size)
+                or quantity <= ZERO
+            ):
                 raise Rejected("quantity below minimum")
             if not limit.is_finite() or not ZERO < limit < ONE or limit % book.tick:
                 raise Rejected("limit price violates tick")

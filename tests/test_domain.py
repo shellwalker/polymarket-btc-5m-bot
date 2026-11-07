@@ -156,3 +156,50 @@ def test_market_missing_rules_fail_closed():
     del raw["markets"][0]["cryptoMarketConfig"]
     with pytest.raises(ValueError, match="TWAP"):
         Market.from_event(raw)
+
+
+def test_trade_updates_latest_price_without_refreshing_book_freshness():
+    book = make_book()
+    book.trade(
+        {"asset_id": "up", "price": "0.53", "size": "2", "timestamp": "1800000003000"}, 1800000003
+    )
+    assert book.latest_trade_price == D("0.53")
+    assert book.latest_trade_time == 1800000003
+    assert book.source_time == 1800000001
+    assert book.updated_at == 1800000001
+    assert not book.healthy(1800000007, 5)
+    book.trade(
+        {"asset_id": "up", "price": "0.50", "size": "1", "timestamp": "1800000002000"}, 1800000004
+    )
+    assert book.latest_trade_price == D("0.53")
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"asset_id": "other"},
+        {"price": "NaN"},
+        {"price": "1.1"},
+        {"size": "-1"},
+        {"size": "0"},
+        {"timestamp": "1800000100000"},
+    ],
+)
+def test_invalid_trade_fails_closed_without_mutating_depth(patch):
+    book = make_book()
+    message = {"asset_id": "up", "price": "0.53", "size": "2", "timestamp": "1800000003000"}
+    message.update(patch)
+    with pytest.raises(ValueError):
+        book.trade(message, 1800000003)
+    assert book.latest_trade_price is None
+    assert book.updated_at == 1800000001
+    assert book.asks == {D("0.51"): D("10")}
+
+
+def test_health_rechecks_all_depth_prices_after_tick_change_or_corruption():
+    book = make_book()
+    book.asks[D("0.515")] = D("10")
+    assert not book.healthy(1800000002, 5)
+    book = make_book()
+    book.tick = D("0.1")
+    assert not book.healthy(1800000002, 5)
