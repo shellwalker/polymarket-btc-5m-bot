@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from copy import copy
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any
@@ -127,7 +128,7 @@ class PublicAPI:
 
 
 class MarketStream:
-    """Resubscribe, REST resync, then consume initial WS dump before trading.
+    """REST resync before subscription; WS initial dump owns the ordered baseline.
 
     There is no WS sequence number. Older timestamps never overwrite newer
     snapshots. A gap/disconnect invalidates every book immediately.
@@ -147,19 +148,57 @@ class MarketStream:
         self.on_update, self.connect, self.clock = on_update, connect, clock
         self.reconnects = 0
         self.ready = False
+        self.gap_started: float | None = None
+        self.last_gap_seconds: float | None = None
 
     def invalidate(self) -> None:
         self.ready = False
+        if self.gap_started is None:
+            self.gap_started = self.clock()
         for book in self.books.values():
             book.disconnect()
         self.on_update()
 
-    def apply_snapshot(self, token: str, snapshot: dict[str, Any]) -> None:
+    def apply_snapshot(
+        self, token: str, snapshot: dict[str, Any], *, initial: bool = False
+    ) -> None:
         book = self.books[token]
+        if initial:
+            # WS initial dump is its own ordered baseline, not a merge into a
+            # potentially newer REST state with already queued old deltas.
+            if (
+                self.clock() - float(number(snapshot["timestamp"]) / 1000)
+                > self.settings.stale_seconds
+            ):
+                raise ValueError("stale initial websocket snapshot")
+            book.source_time = 0
         if number(snapshot["timestamp"]) / 1000 >= book.source_time:
             if "tick_size" in snapshot:
                 book.change_tick(snapshot["tick_size"])
         book.snapshot(snapshot, self.clock())
+
+    def apply_price_change(self, message: dict[str, Any], pending: set[str]) -> None:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        staged: dict[str, Book] = {}
+        try:
+            for change in message["price_changes"]:
+                asset = change["asset_id"]
+                if asset in self.books:
+                    if asset in pending:
+                        raise ValueError("delta before initial WS snapshot")
+                    grouped.setdefault(asset, []).append(change)
+            for asset, changes in grouped.items():
+                candidate = copy(self.books[asset])
+                candidate.connected = True  # This token's initial dump is complete.
+                candidate.deltas(changes, message["timestamp"], self.clock())
+                staged[asset] = candidate
+            for asset, candidate in staged.items():
+                book = self.books[asset]
+                book.bids, book.asks = candidate.bids, candidate.asks
+                book.source_time, book.updated_at = candidate.source_time, candidate.updated_at
+        except (ValueError, KeyError, TypeError):
+            self.invalidate()
+            raise
 
     async def run(self, stop: asyncio.Event) -> None:
         delay = self.settings.retry_initial
@@ -167,6 +206,11 @@ class MarketStream:
             while not stop.is_set():
                 self.invalidate()
                 try:
+                    snapshots = await asyncio.gather(*(self.api.snapshot(t) for t in self.books))
+                    for initial_token, snapshot in zip(self.books, snapshots, strict=True):
+                        self.books[initial_token].source_time = 0
+                        self.apply_snapshot(initial_token, snapshot)
+                        self.books[initial_token].connected = False
                     async with self.connect(
                         WS_URL,
                         ping_interval=None,
@@ -185,12 +229,6 @@ class MarketStream:
                                 }
                             )
                         )
-                        snapshots = await asyncio.gather(
-                            *(self.api.snapshot(t) for t in self.books)
-                        )
-                        for initial_token, snapshot in zip(self.books, snapshots, strict=True):
-                            self.apply_snapshot(initial_token, snapshot)
-                            self.books[initial_token].connected = False
                         pending = set(self.books)
                         loop = asyncio.get_running_loop()
                         connected_since = loop.time()
@@ -223,20 +261,12 @@ class MarketStream:
                                     kind = message.get("event_type")
                                     token = message.get("asset_id")
                                     if kind == "book" and token in self.books:
-                                        self.apply_snapshot(token, message)
+                                        self.apply_snapshot(
+                                            token, message, initial=token in pending
+                                        )
                                         pending.discard(token)
                                     elif kind == "price_change":
-                                        for change in message["price_changes"]:
-                                            asset = change["asset_id"]
-                                            if asset in self.books:
-                                                # Initial dump must precede deltas.
-                                                if asset in pending:
-                                                    raise ValueError(
-                                                        "delta before initial WS snapshot"
-                                                    )
-                                                self.books[asset].delta(
-                                                    change, message["timestamp"], self.clock()
-                                                )
+                                        self.apply_price_change(message, pending)
                                     elif kind == "last_trade_price" and token in self.books:
                                         self.books[token].trade(message, self.clock())
                                     elif kind == "tick_size_change" and token in self.books:
@@ -252,7 +282,25 @@ class MarketStream:
                                         "tick_size_change",
                                     }:
                                         raise ValueError(f"unknown websocket event: {kind}")
+                                was_ready = self.ready
                                 self.ready = not pending
+                                if self.ready and not was_ready:
+                                    self.last_gap_seconds = (
+                                        self.clock() - self.gap_started
+                                        if self.gap_started is not None
+                                        else 0
+                                    )
+                                    LOG.info(
+                                        "ws_recovered",
+                                        extra={
+                                            "details": {
+                                                "assets": list(self.books),
+                                                "reconnects": self.reconnects,
+                                                "gap_seconds": self.last_gap_seconds,
+                                            }
+                                        },
+                                    )
+                                    self.gap_started = None
                                 for asset, book in self.books.items():
                                     book.connected = self.ready and asset not in pending
                                 if self.ready and loop.time() - connected_since >= 30:
@@ -273,6 +321,8 @@ class MarketStream:
                                 "error": str(exc),
                                 "delay": delay,
                                 "reconnects": self.reconnects,
+                                "gap_started": self.gap_started,
+                                "assets": list(self.books),
                             }
                         },
                     )

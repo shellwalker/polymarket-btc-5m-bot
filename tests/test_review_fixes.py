@@ -17,7 +17,9 @@ def ready_service(tmp_path, **config):
     service = Service(settings, None, clock=lambda: 1800000002.0)
     service.market = Market.from_event(event())
     service.books = {"up": make_book(), "down": make_book("down")}
-    service.stream = SimpleNamespace(ready=True, reconnects=0)
+    service.stream = SimpleNamespace(
+        ready=True, reconnects=0, gap_started=None, last_gap_seconds=None
+    )
     service.ledger = Ledger(tmp_path / "ledger.sqlite3", settings)
     service.strategy = SimpleNamespace(signal=lambda *a: Signal("Up", D("5"), D(".53"), "decision"))
     return service

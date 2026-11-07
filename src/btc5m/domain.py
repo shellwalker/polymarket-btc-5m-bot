@@ -230,24 +230,47 @@ class Book:
             raise ValueError(f"invalid book snapshot: {exc}") from exc
 
     def delta(self, change: dict[str, Any], timestamp: Any, now: float) -> None:
+        self.deltas([change], timestamp, now)
+
+    def deltas(self, changes: list[dict[str, Any]], timestamp: Any, now: float) -> None:
+        """Commit one complete message, including authoritative top-of-book bounds."""
         try:
-            if not self.connected or change.get("asset_id") != self.asset_id:
-                raise ValueError("delta before snapshot or asset mismatch")
+            if not self.connected:
+                raise ValueError("delta before snapshot")
             source_time = self._time(timestamp, now)
             if source_time < self.source_time:
                 return
-            if change.get("side") not in {"BUY", "SELL"}:
-                raise ValueError("unknown book side")
-            price, size = number(change["price"]), number(change["size"])
-            if not ZERO < price < ONE or size < ZERO or price % self.tick:
-                raise ValueError("invalid delta price or size")
-            side = self.bids if change["side"] == "BUY" else self.asks
-            if size:
-                side[price] = size
-            else:
-                side.pop(price, None)
-            if self.bids and self.asks and max(self.bids) >= min(self.asks):
+            bids, asks = dict(self.bids), dict(self.asks)
+            bounds = None
+            for change in changes:
+                if change.get("asset_id") != self.asset_id:
+                    raise ValueError("asset mismatch")
+                if change.get("side") not in {"BUY", "SELL"}:
+                    raise ValueError("unknown book side")
+                price, size = number(change["price"]), number(change["size"])
+                if not ZERO < price < ONE or size < ZERO or price % self.tick:
+                    raise ValueError("invalid delta price or size")
+                side = bids if change["side"] == "BUY" else asks
+                if size:
+                    side[price] = size
+                else:
+                    side.pop(price, None)
+                if "best_bid" in change or "best_ask" in change:
+                    bid, ask = number(change["best_bid"]), number(change["best_ask"])
+                    if not ZERO <= bid < ask <= ONE:
+                        raise ValueError("crossed advertised book top")
+                    bounds = bid, ask
+            if bounds is not None:
+                bid, ask = bounds
+                # Public deltas can omit zero-size removals after a match. Only remove
+                # levels contradicted by official bounds; never synthesize new depth.
+                bids = {p: q for p, q in bids.items() if p <= bid}
+                asks = {p: q for p, q in asks.items() if p >= ask}
+                if (max(bids) if bids else ZERO) != bid or (min(asks) if asks else ONE) != ask:
+                    raise ValueError("book top mismatch requires snapshot resync")
+            if bids and asks and max(bids) >= min(asks):
                 raise ValueError("crossed order book")
+            self.bids, self.asks = bids, asks
             self.source_time, self.updated_at = source_time, now
         except (ValueError, KeyError, TypeError) as exc:
             self.disconnect()

@@ -82,7 +82,7 @@ uv run --locked btc5m summary
 tail -f runtime/logs/paper.jsonl
 ```
 
-`status/health` 以独占锁检测进程，pidfile 只是诊断信息；`trading_ready` 同时要求健康盘口、当前可入场时间、无停止请求/熔断，以及至少一个方向的最小交易通过现金、日亏损预留、总敞口和单笔预算检查。`risk_blocked_reasons` 显示阻止最小交易的原因；这是健康预检，不保证策略指定的更大数量一定可成交，实际成交仍在事务内重新检查。`health.json` 的 `updated` 可识别进程卡住，`running=true` 仅说明仍持锁，不代表交易可用。地理查询原样记录（此 box 实测 `blocked=true, US/CA`），公共数据可达时允许只读 paper，不绕过限制。HTTP 忽略环境代理、WS 禁用代理。
+`status/health` 以独占锁检测进程，pidfile 只是诊断信息；`trading_ready` 同时要求健康盘口、当前可入场时间、无停止请求/熔断，以及至少一个方向的最小交易通过现金、日亏损预留、总敞口和单笔预算检查。`risk_blocked_reasons` 显示阻止最小交易的原因；这是健康预检，不保证策略指定的更大数量一定可成交，实际成交仍在事务内重新检查。`reconnects` 是本次进程跨市场累计失败次数；`gap_started`/`last_gap_seconds` 和 `ws_recovered` 日志记录同步缺口及恢复时长。相同窗口的 tick 元数据刷新不重建订阅，盘口 tick 由有序 WS/快照更新；condition/token/窗口身份变化会熔断。`health.json` 的 `updated` 可识别进程卡住，`running=true` 仅说明仍持锁，不代表交易可用。地理查询原样记录（此 box 实测 `blocked=true, US/CA`），公共数据可达时允许只读 paper，不绕过限制。HTTP 忽略环境代理、WS 禁用代理。
 
 运行目录固定包含 `ledger.sqlite3`（WAL/FULL 同步）、`process.lock`、`pid.json`、`health.json`、`STOP` 和日志。`paper.jsonl` 单文件 5 MB、保留 5 个备份；`launcher.log` 记录后台启动错误。SQLite 是审计事实来源；`events` 包含 signal、拒绝、成交、结算、熔断及状态事件，`orders/fills/settlements/daily/meta` 保存账本。行情原始帧不全量保存，DB 不自动删除审计记录。
 
@@ -115,7 +115,7 @@ uv run --locked btc5m start
 - 仅模拟买入 taker，按 ask 从低到高逐档成交。每档遵守 tick/滑点/限价，整单数量不足则拒绝；扣减深度与持久窗口去重共同避免重复使用。不是 maker 队列或部分成交模拟。
 - 每个价格档默认手续费 `C × 0.07 × p × (1-p)`；可设置 `paper_fee_multiplier`（例如2）做保守压力测试，策略费用过滤和每档撮合统一使用 `0.07 × paper_fee_multiplier`，四舍五入至 5 位小数后求和；此逐档聚合及 HALF_UP 是明确的模拟假设，不模拟返佣、链上费用和真实 match 拆分。health、启动日志/事件和成交审计事件记录 `verified_fee_rate`、`paper_fee_multiplier`、`paper_fee_rate`；倍数只是paper假设，绝非实时费率声明。重启修改倍数只影响后续信号/新成交，不追改既有费用。
 - 每次发现验证该市场 `crypto_fees_v2` / exponent=1 / rate=0.07 / takerOnly=true。仅支持已观察的 v1 token schema、BTC 60s TWAP 规则配置；v2/未知费用和规则均停止新交易。
-- 重连时全盘口失效，重新订阅、REST 重同步，再经过 WS 初始快照屏障恢复；旧时间戳不覆盖新数据。没有 WS 序号可做绝对缺口证明，同毫秒事件按接收顺序处理；异常时断开并 resync。
+- 重连时全盘口失效，先做 REST 重同步，再订阅并等待每个 token 的 WS 初始快照建立独立有序基线，避免把已排队的旧增量混入较新的 REST 盘口。完整 price_change 跨 token 原子应用，官方 best_bid/best_ask 边界只删除矛盾旧档位，不创造缺失深度；结果仍交叉或最优价缺档则重同步。后续旧时间戳不覆盖新数据。没有 WS 序号可做绝对缺口证明，同毫秒事件按接收顺序处理；异常时断开并 resync。
 - 到窗口结束不再开仓；只接受官方 Gamma `closed=true`、`umaResolutionStatus=resolved` 且 token/condition 精确匹配、结果唯一为 1/0 的结算。该字段名不意味着本程序执行 UMA：当前 BTC 规则使用 Chainlink 60s TWAP，平局 Up。绝不拿现货或时间到期猜赢家。
 - 官方字段迁移、结果未就绪、数据源不可达时持仓保持 pending、继续占用风险预算；无结算时限保证。这里只记录模拟 $1/份兑付，不发链上 redeem。
 - 显示深度不保证真实可成交；延迟、抢跑、隐藏深度、队列、价格冲击没有完整建模。保守约束也不能证明模拟结果能复制到真实市场。

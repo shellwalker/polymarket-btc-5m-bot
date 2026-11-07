@@ -10,6 +10,7 @@ import os
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from pathlib import Path
 from typing import IO, Any
 
@@ -91,6 +92,8 @@ class Service:
         self.settings, self.api, self.clock = settings, api, clock
         self.connect = connect
         self.market: Market | None = None
+        self.known_market: Market | None = None
+        self.prior_reconnects = 0
         self.next_market: Market | None = None
         self.books: dict[str, Book] = {}
         self.strategy = MomentumStrategy(settings)
@@ -168,12 +171,34 @@ class Service:
                 self.last_rejection = reason
 
     async def switch(self, market: Market | None) -> None:
+        if market is not None and self.known_market is not None:
+            known = self.known_market
+            if market.slug == known.slug:
+                if (market.start, market.end, market.condition, market.tokens) != (
+                    known.start,
+                    known.end,
+                    known.condition,
+                    known.tokens,
+                ):
+                    if self.ledger is not None:
+                        self.ledger.trip("market_identity_changed", self.clock())
+                    await self.switch(None)
+                    raise ValueError("same-window market identity changed")
+                if self.market is not None:
+                    # Polling metadata can lag WS dynamic ticks. Refresh constraints
+                    # in place; only the ordered WS/snapshot feed changes book ticks.
+                    self.market = replace(self.market, min_size=market.min_size)
+                    return
+        if market is not None:
+            self.known_market = market
         self.switching = True
         try:
             self.stream_stop.set()
             if self.stream_task is not None:
                 self.stream_task.cancel()
                 await asyncio.gather(self.stream_task, return_exceptions=True)
+            if self.stream is not None:
+                self.prior_reconnects += self.stream.reconnects
             self.market, self.books, self.stream = market, {}, None
             self.ever_ready = False
             self.last_rejection = ""
@@ -258,7 +283,10 @@ class Service:
                 "risk_blocked_reasons": risk_blocked,
                 **self.settings.fee_assumption(),
                 "geoblock": self.geo,
-                "reconnects": self.stream.reconnects if self.stream else 0,
+                "reconnects": self.prior_reconnects
+                + (self.stream.reconnects if self.stream else 0),
+                "gap_started": self.stream.gap_started if self.stream else None,
+                "last_gap_seconds": self.stream.last_gap_seconds if self.stream else None,
                 "summary": summary,
             },
         )
