@@ -1,0 +1,36 @@
+name: paper-mvp
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.13.5'
+          enable-cache: true
+      - run: uv sync --locked --python ${{ matrix.python }} --group dev
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked ruff check .
+      - run: uv run --locked mypy src
+      - run: uv run --locked pytest -q
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.3'
+          cache: false
+      - run: go install github.com/zricethezav/gitleaks/v8@v8.24.3
+      - run: gitleaks git --redact --log-opts='--all' --exit-code=1 .
+      - run: gitleaks dir --redact --exit-code=1 .

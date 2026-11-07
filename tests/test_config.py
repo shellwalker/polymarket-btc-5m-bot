@@ -1,0 +1,64 @@
+from decimal import Decimal
+
+import pytest
+
+from btc5m.config import Settings
+
+
+def test_defaults_and_env_override(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text('max_trade="12.5"\nlive=false\n')
+    settings = Settings.load(config, {"BTC5M_MAX_TRADE": "7"})
+    assert settings.max_trade == Decimal("7")
+    assert not settings.live
+
+
+@pytest.mark.parametrize("value", ["true", "1", "yes"])
+def test_live_always_refused(value):
+    with pytest.raises(ValueError, match="live"):
+        Settings.load(environ={"BTC5M_LIVE": value})
+
+
+@pytest.mark.parametrize(
+    "key,value", [("shares", "NaN"), ("stale_seconds", "inf"), ("max_trade", "-1"), ("bogus", "5")]
+)
+def test_invalid_settings_refused(tmp_path, key, value):
+    path = tmp_path / "config.toml"
+    path.write_text(f'{key}="{value}"')
+    with pytest.raises(ValueError):
+        Settings.load(path, {})
+
+
+def test_live_in_file_cannot_be_hidden_by_environment(tmp_path):
+    config = tmp_path / "live.toml"
+    config.write_text("live=true\n")
+    with pytest.raises(ValueError, match="paper"):
+        Settings.load(config, {"BTC5M_LIVE": "false"})
+
+
+@pytest.mark.parametrize("key", ["equity_snapshot_seconds", "valuation_stale_seconds"])
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "true"])
+def test_invalid_observability_settings(key, value):
+    with pytest.raises(ValueError):
+        Settings.load(environ={"BTC5M_" + key.upper(): value})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "diagnostic_heartbeat_seconds",
+        "continuity_gap_seconds",
+        "clock_tolerance_seconds",
+        "http_response_seconds",
+        "http_total_seconds",
+        "ws_sync_seconds",
+        "ws_send_seconds",
+        "cleanup_seconds",
+        "slow_operation_seconds",
+        "slow_diagnostic_throttle_seconds",
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "true"])
+def test_reliability_budgets_must_be_positive_finite(key, value):
+    with pytest.raises(ValueError):
+        Settings.load(environ={"BTC5M_" + key.upper(): value})
