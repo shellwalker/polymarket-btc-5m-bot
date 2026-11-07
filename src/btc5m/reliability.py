@@ -200,14 +200,71 @@ class Supervisor:
             )
 
 
-def clock_sample() -> dict[str, float | None]:
+def sample_observed_at(sample: dict[str, Any]) -> float:
+    """Last observed wall in a sample; legacy injected clock mappings remain valid."""
+    return float(sample.get("sample_completed_at", sample["wall"]))
+
+
+def changed_fields(
+    old: dict[str, Any], new: dict[str, Any], keys: Sequence[str] | None = None
+) -> dict[str, Any]:
+    selected = keys if keys is not None else sorted((old.keys() | new.keys()) - {"uptime"})
     return {
-        "wall": time.time(),
-        "monotonic": time.monotonic(),
-        "boottime": time.clock_gettime(time.CLOCK_BOOTTIME)
-        if hasattr(time, "CLOCK_BOOTTIME")
-        else None,
-        "process_cpu": time.process_time(),
+        key: {"old": old.get(key), "new": new.get(key)}
+        for key in selected
+        if old.get(key) != new.get(key)
+    }
+
+
+def clock_sample(
+    tolerance_seconds: float = 2.0,
+    *,
+    wall: Callable[[], float] | None = None,
+    monotonic: Callable[[], float] | None = None,
+    boottime: Callable[[], float | None] | None = None,
+    cpu: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    wall = wall or time.time
+    monotonic = monotonic or time.monotonic
+    boottime = boottime or (
+        lambda: time.clock_gettime(time.CLOCK_BOOTTIME) if hasattr(time, "CLOCK_BOOTTIME") else None
+    )
+    cpu = cpu or time.process_time
+    before: dict[str, Any] = {
+        "wall": wall(),
+        "monotonic": monotonic(),
+        "boottime": boottime(),
+        "process_cpu": cpu(),
+    }
+    after: dict[str, Any] = {
+        "process_cpu": cpu(),
+        "boottime": boottime(),
+        "monotonic": monotonic(),
+        "wall": wall(),
+    }
+    spans: dict[str, Any] = {
+        key: after[key] - before[key]
+        if after[key] is not None and before[key] is not None
+        else None
+        for key in before
+    }
+    reasons = []
+    for key, value in spans.items():
+        if value is not None and value < 0:
+            reasons.append(key + "_sampling_backwards")
+        if value is not None and value > tolerance_seconds:
+            reasons.append(key + "_sampling_span")
+    for key in ("wall", "boottime"):
+        if spans[key] is not None and abs(spans[key] - spans["monotonic"]) > tolerance_seconds:
+            reasons.append(key + "_sampling_divergence")
+    return {
+        **before,
+        "sample_wall": before["wall"],
+        "sample_completed_at": after["wall"],
+        "sampling_bracket": {"before": before, "after": after},
+        "sampling_spans": spans,
+        "sample_consistent": not reasons,
+        "sample_reason_codes": reasons,
     }
 
 
@@ -251,10 +308,13 @@ class Diagnostics:
         self,
         settings: Settings,
         *,
-        clocks: Callable[[], dict[str, Any]] = clock_sample,
+        clocks: Callable[[], dict[str, Any]] | None = None,
         identity: Callable[[], dict[str, Any]] = raw_identity,
+        wall_clock: Callable[[], float] | None = None,
     ):
-        self.settings, self.clocks, self.identity = settings, clocks, identity
+        self.settings, self.identity = settings, identity
+        self.clocks = clocks or (lambda: clock_sample(settings.clock_tolerance_seconds))
+        self.wall_clock = wall_clock or (lambda: sample_observed_at(self.clocks()))
         self.previous: dict[str, Any] | None = None
         self.workers: dict[str, dict[str, Any]] = {}
         self.latest: dict[str, Any] | None = None
@@ -275,7 +335,7 @@ class Diagnostics:
             k: clocks[k] - old["clocks"][k]
             if same and clocks[k] is not None and old["clocks"][k] is not None
             else None
-            for k in clocks
+            for k in ("wall", "monotonic", "boottime", "process_cpu")
         }
         difference = deltas["wall"] - deltas["monotonic"] if same else None
         boot_difference = (
@@ -285,7 +345,8 @@ class Diagnostics:
         )
         tolerance = self.settings.clock_tolerance_seconds
         abnormal = same and (
-            any(
+            clocks.get("sample_consistent") is False
+            or any(
                 deltas[k] is not None
                 and (deltas[k] > self.settings.continuity_gap_seconds or deltas[k] < -tolerance)
                 for k in ("wall", "monotonic", "boottime")
@@ -299,13 +360,37 @@ class Diagnostics:
             and deltas["monotonic"] < self.settings.diagnostic_heartbeat_seconds
         ):
             return None, None
-        identity = self.identity()
-        if same and identity != old["identity"]:
+        identity = dict(self.identity())
+        changes = changed_fields(old["identity"], identity) if same else {}
+        btime_delta = (
+            identity["btime"] - old["identity"]["btime"]
+            if same
+            and identity.get("btime") is not None
+            and old["identity"].get("btime") is not None
+            else None
+        )
+        if same and changes:
             abnormal = True
+        detected_at = self.wall_clock()
+        identity["uptime"] = {
+            "seconds": clocks.get("boottime", None)
+            if clocks.get("boottime") is not None
+            else clocks["monotonic"],
+            "source": "sampled CLOCK_BOOTTIME"
+            if clocks.get("boottime") is not None
+            else "sampled CLOCK_MONOTONIC (suspend excluded)",
+            "sample_consistent": clocks.get("sample_consistent"),
+            "sample_wall": clocks["wall"],
+        }
         beat = {
             "run_id": run_id,
             "clocks": clocks,
             "identity": identity,
+            "sample_wall": clocks["wall"],
+            "detected_at": detected_at,
+            "changed_fields": changes,
+            "btime_delta": btime_delta,
+            "process_identity_changed": any(k in changes for k in ("pid", "start_ticks", "sid")),
             "workers": {name: dict(progress) for name, progress in self.workers.items()},
         }
         gap = None
@@ -321,7 +406,12 @@ class Diagnostics:
                 "deltas": deltas,
                 "wall_minus_monotonic_delta": difference,
                 "boottime_minus_monotonic_delta": boot_difference,
-                "identity_changed": identity != old["identity"],
+                "identity_changed": bool(changes),
+                "changed_fields": changes,
+                "btime_delta": btime_delta,
+                "process_identity_changed": beat["process_identity_changed"],
+                "sample_wall": clocks["wall"],
+                "detected_at": detected_at,
                 "skipped_window_count": count,
                 "skipped_windows": [
                     f"btc-updown-5m-{first + i * 300}" for i in range(min(count, 100))

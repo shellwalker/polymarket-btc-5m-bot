@@ -211,19 +211,28 @@ class Service:
         self.continuity.poll()
         events, self.continuity.events = self.continuity.events, []
         for kind, event_details in events:
-            event_details = {**event_details, "run_id": self.run_id}
+            event_details = {
+                **event_details,
+                "run_id": self.run_id,
+                "emitted_at": self.diagnostics.wall_clock(),
+            }
             LOG.info(kind, extra={"details": event_details})
             if self.ledger is not None:
-                self.ledger.event(kind, event_details, event_details["recovered_at"])
+                self.ledger.event(
+                    kind,
+                    event_details,
+                    event_details.get("detected_at", event_details["recovered_at"]),
+                )
         beat, gap = self.diagnostics.heartbeat(self.run_id)
         if beat is None:
             return
         for kind, details in [("heartbeat", beat), ("continuity_gap", gap)]:
             if details is None:
                 continue
+            details = {**details, "emitted_at": self.diagnostics.wall_clock()}
             LOG.info(kind, extra={"details": details})
             if self.ledger is not None:
-                self.ledger.event(kind, details, beat["clocks"]["wall"])
+                self.ledger.event(kind, details, details.get("detected_at", beat["clocks"]["wall"]))
 
     async def periodic_diagnostics(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -425,6 +434,7 @@ class Service:
                 supervisor=self.supervisor,
                 progress=lambda phase: self.diagnostics.progress("stream", phase),
                 continuity=self.continuity,
+                market=market,
                 **kwargs,
             )
             self.stream_task = asyncio.create_task(self.stream.run(self.stream_stop))

@@ -266,3 +266,45 @@ uv run --locked btc5m status
 - runtime、数据库、日志、.env、密钥扩展名均忽略。不要在 checkout 添加真实账户资料；程序没有读取它们的路径。
 
 官方核实、假设、参考仓库安全评审范围与本次验证证据见 [MARKET_RESEARCH](docs/MARKET_RESEARCH.md) 和 [VALIDATION](docs/VALIDATION.md)。
+
+### 重同步失败与时钟采样诊断
+
+`ws_resync_incomplete` 在清空盘口之前输出，每次失败的完整双 token dump 最多一条；
+原错误文本 `current-epoch dual-token resync incomplete`、完整双 token gate、手动亏损锁存、
+交易参数和重连退避上限 30 秒均保持不变。成功请求不会因此增加日志。
+结构化 `details` 上限 8192 UTF-8 字节，最多检查两个预期 token；不记录原始帧。
+`expected_tokens/actual_tokens/missing_tokens/unexpected_tokens` 配合数量及截断标志使用，
+token/asset ID 最多 128 字符（正常 78 位 ID 完整保留），slug 文本最多 64 字符；
+仅超长 ID 设置 token_text_truncated 及逐 token 的 token_truncated/asset_id_truncated。`market` 包含 slug、start、end、remaining_seconds。
+`epochs`、`lease`（匹配/是否存在及 current_sync_sequence）、stream_epoch、
+stream_sync_sequence 和每 token 的 epoch/sync_sequence 都是数值或布尔身份，不输出对象地址。
+
+`reason_codes` 汇总所有检查出的失败条件：epoch_mismatch、lease_mismatch、tokens_mismatch、
+no_books、missing_token、book_epoch_mismatch、book_sync_sequence_mismatch、disconnected、
+invalid_depth、empty_bids/empty_asks、missing_best_bid/missing_best_ask、crossed_or_locked、
+received_time_future/received_stale、source_time_future/source_stale、
+received_age_nonfinite/source_age_nonfinite；价格读取异常为 best_prices_unavailable。
+每 token 同时记录 bid_levels/ask_levels、best_bid/best_ask、tick、connected、valid_depth、
+source_at/received_at 和 source_age_seconds/received_age_seconds；缺失或非有限年龄为 null。
+诊断仅解释失败，不授权开 gate。若检查期间 epoch 改变，附 pre_poll_tokens 和 changed_during_poll；
+极端长度下 diagnostics_truncated 表示可选细节已缩减。
+
+时钟采样以 wall→monotonic→boottime→process_cpu 读取，再反序读取形成括号。
+原 clocks.wall/monotonic/boottime/process_cpu 保留第一轮原始值；sampling_bracket、
+sampling_spans、sample_consistent、sample_reason_codes 标注采样跨度、倒退及跨钟差异。
+使用已有 clock_tolerance_seconds 判断，不新增交易配置。
+混合采样仍失效关闭；后续稳定采样若再次满足异常条件仍递增 epoch，不作不安全去重。
+这不是原子采样，容差以内的中断仍可能不可辨认。
+
+sample_wall 是第一轮 wall；sample_completed_at 是括号末尾 wall；detected_at 是判定后新读取的
+wall；emitted_at 是输出时新读取的 wall。新异常账本事件 created 使用 detected_at，
+不使用可能过时的 sample_wall；旧 recovered_at 仍保留原 sampled wall 语义，旧事件完全不改写。
+旧版注入时钟没有括号字段时仍兼容。heartbeat/gap 的 changed_fields（事件顶层）记录原始身份字段 old/new，btime_delta 单列；process_identity_changed
+只表示 PID/SID/start_ticks 原始字段变化，不把 btime 漂移当成进程重启证明。
+identity.uptime.seconds 来自采样 CLOCK_BOOTTIME，source 明确标识；不可用时回退到
+CLOCK_MONOTONIC（不含 suspend），并带 sample_wall/sample_consistent。
+这不是 wall-btime 推算的进程启动日期，也不是另行读取的 /proc/uptime。
+
+这些字段用于区分观察事实与推测，cause 仍为 unknown；历史约 24 分钟间隙的平台根因仍未知。
+同机诊断无法在整机暂停期间运行；检测和截止执行要求事件循环可运行，最终安全检查之后
+发生暂停的不可避免窗口依然存在。

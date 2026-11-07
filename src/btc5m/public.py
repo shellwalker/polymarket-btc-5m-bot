@@ -20,6 +20,8 @@ from .config import Settings
 from .continuity import ContinuityBarrier, ContinuityChanged
 from .domain import Book, Market, number, window_slugs
 from .reliability import CleanupIncomplete, OperationDeadline, Supervisor
+from .resync_diagnostics import bounded, text
+from .telemetry import current_run_id
 
 LOG = logging.getLogger(__name__)
 BASES = {
@@ -210,12 +212,14 @@ class MarketStream:
         supervisor: Supervisor | None = None,
         progress: Callable[[str], None] | None = None,
         continuity: ContinuityBarrier | None = None,
+        market: Market | None = None,
     ) -> None:
         self.settings, self.api, self.books = settings, api, books
         self.on_update, self.connect, self.clock = on_update, connect, clock
         self.supervisor = supervisor or Supervisor(settings.cleanup_seconds)
         self.progress = progress or (lambda phase: None)
         self.continuity = continuity
+        self.market = market
         self.epoch = continuity.epoch if continuity else 0
         self.lease = object()
         self.sync_started = False
@@ -226,6 +230,28 @@ class MarketStream:
         self.ready = False
         self.gap_started: float | None = None
         self.last_gap_seconds: float | None = None
+
+    def report_resync_failure(self) -> None:
+        """One bounded report per failed dump, before destructive invalidation."""
+        if self.continuity is None:
+            return
+        details = dict(self.continuity.last_resync_failure or {})
+        sampled = details.get("sample_wall", self.clock())
+        details.update(
+            run_id=current_run_id(),
+            emitted_at=self.continuity.wall_clock(),
+            stream_epoch=self.epoch,
+            stream_sync_sequence=self.sync_sequence,
+            market={
+                "slug": text(self.market.slug),
+                "start": self.market.start,
+                "end": self.market.end,
+                "remaining_seconds": self.market.end - sampled,
+            }
+            if self.market
+            else None,
+        )
+        LOG.warning("ws_resync_incomplete", extra={"details": bounded(details)})
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Any]:
@@ -505,6 +531,7 @@ class MarketStream:
                                     if not self.continuity.complete(
                                         self.epoch, self.lease, self.books, self.clock()
                                     ):
+                                        self.report_resync_failure()
                                         self.invalidate()
                                         raise ValueError(
                                             "current-epoch dual-token resync incomplete"
